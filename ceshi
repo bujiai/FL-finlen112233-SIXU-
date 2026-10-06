@@ -256,9 +256,10 @@ function CX_CRACK.Collect()
 	if not root then return out end
 
 	local seen = 0
+	-- ⚠️ 原来上限 4 万，容易漏掉容器 ⇒ 放宽到 20 万（Luau 没有 goto，别用）
 	for _, d in ipairs(root:GetDescendants()) do
 		seen = seen + 1
-		if seen > 40000 then break end
+		if seen > 200000 then break end
 		local ok, id = pcall(function() return d:GetAttribute("objectId") end)
 		if ok and type(id) == "string" then
 			local ok2, gt = pcall(function() return d:GetAttribute("gizmoType") end)
@@ -324,6 +325,359 @@ function CX_CRACK.Status()
 	return string.format("已破解 %d 个 / 失败 %d | 半径 %.0f | %s",
 		CX_CRACK.Done, CX_CRACK.Failed, CX_CRACK.Radius,
 		tostring(CX_CRACK.LastErr or "ok"))
+end
+
+-- ==================================================================
+--  RageBot v2（CX_RAGE）—— 按 `通缉ragebot(1).lua` 的真实协议重写
+--
+--  ⭐ 参考源码揭示的正确击杀协议（**服务端认的就是这两个包**）：
+--      local f = Network.FireServer
+--      local g = Network.InvokeServer
+--      local i = load("NUID")            -- 8 位纯数字 id
+--      local h = load("MathUtil")        -- CompressCFrame
+--      local j = load("ClientTools")     -- GetLocalEquippedTool
+--      local k = load("EquippedScreen")  -- SetAmmo（本地 UI 同步）
+--
+--      1) 本地扣弹药 + 同步 UI：  a.toolState.ammo -= 1;  k:SetAmmo(...)
+--      2) 告诉服务端"我开枪了"：
+--           g("shoot", toolId, CompressCFrame(CFrame.lookAlong(枪口, 方向)), { { nuid, cframe } })
+--      3) 告诉服务端"子弹打中了"：
+--           f("registerProjectileHits", nuid, toolId, { {
+--                 normal = -方向, direction = 方向, hitName = "Head",
+--                 source = "Bullet", userId = 目标.UserId, massLimit = 5,
+--                 ownerId = 自己.UserId, position = 命中点, processedPlayerId = 自己.UserId,
+--                 hit = 目标头部实例, speed = 枪口初速, collisionPoint = 命中点,
+--                 material = Enum.Material.Plastic, hitType = "player",
+--           } })
+--
+--  ⭐ 这版把"只打最近一个"改成 **打范围内所有人**（每个目标一套 shoot+hits）。
+-- ==================================================================
+do
+	local Players = game:GetService("Players")
+	local RunService = game:GetService("RunService")
+	local ReplicatedStorage = game:GetService("ReplicatedStorage")
+	local LocalPlayer = Players.LocalPlayer
+
+	CX_RAGE = CX_RAGE or {}
+	CX_RAGE.Enabled    = false
+	CX_RAGE.Range      = 300      -- ⭐ 作用范围（studs）
+	CX_RAGE.Interval   = 0.1      -- 每轮间隔
+	CX_RAGE.MaxTargets = 8        -- 一轮最多打几个（防刷爆 rateLimit）
+	CX_RAGE.Part       = "Head"   -- 瞄哪个部位
+	CX_RAGE.TeamCheck  = false    -- 不打同队
+	CX_RAGE.OnlyCombat = false    -- 只打"战斗模式"的人
+	CX_RAGE.Tracer     = true     -- 画弹道
+	CX_RAGE.Shots      = 0
+	CX_RAGE.Kills      = 0
+	CX_RAGE.LastErr    = nil
+	CX_RAGE._conn      = nil
+	CX_RAGE._reloading = false
+
+	local Devv, Network, MathUtil, NUID, ClientTools, EquippedScreen
+	pcall(function()
+		Devv = require(ReplicatedStorage.Devv)
+		Network       = Devv.load("Network")
+		MathUtil      = Devv.load("MathUtil")
+		NUID          = Devv.load("NUID")
+		ClientTools   = Devv.load("ClientTools")
+		EquippedScreen= Devv.load("EquippedScreen")
+	end)
+
+	local function nuid()
+		if NUID then
+			local ok, id = pcall(NUID)
+			if ok and id then return id end
+		end
+		local r = Random.new()
+		local t = ""
+		for _ = 1, 8 do t = t .. tostring(r:NextInteger(0, 9)) end
+		return t
+	end
+
+	local function compress(cf)
+		if MathUtil and type(MathUtil.CompressCFrame) == "function" then
+			local ok, c = pcall(MathUtil.CompressCFrame, cf)
+			if ok and c then return c end
+		end
+		return cf
+	end
+
+	local function setAmmo(tool)
+		if not (EquippedScreen and tool and tool.toolState) then return end
+		pcall(function()
+			EquippedScreen:SetAmmo(tool.toolState.ammo, tool.toolState.totalAmmo,
+				tool.toolState.isInfinite or false)
+		end)
+	end
+
+	-- 换弹（照参考源码）
+	local function reload(tool)
+		if CX_RAGE._reloading then return end
+		CX_RAGE._reloading = true
+		pcall(function()
+			Network.FireServer("reload", tool:GetId())
+			task.delay(2.5, function()
+				if tool.ammoData and tool.toolState then
+					tool.toolState.ammo = tool.ammoData.magSize or 15
+					setAmmo(tool)
+				end
+				CX_RAGE._reloading = false
+			end)
+		end)
+	end
+
+	-- 找范围内所有合格目标（按距离排序）
+	function CX_RAGE.Targets()
+		local out = {}
+		local char = LocalPlayer.Character
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		if not hrp then return out end
+		local myTeam = LocalPlayer.Team
+
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= LocalPlayer then
+				local c = p.Character
+				local t = c and (c:FindFirstChild(CX_RAGE.Part) or c:FindFirstChild("HumanoidRootPart"))
+				local h = c and c:FindFirstChildOfClass("Humanoid")
+				if c and t and h and h.Health > 0 then
+					local ok = true
+					if CX_RAGE.TeamCheck and myTeam and p.Team == myTeam then ok = false end
+					if ok and CX_RAGE.OnlyCombat then
+						local cm = p:GetAttribute("CombatMode")
+						if cm ~= true then ok = false end
+					end
+					if ok then
+						local d = (hrp.Position - t.Position).Magnitude
+						if d <= CX_RAGE.Range then
+							out[#out + 1] = { player = p, part = t, dist = d, hum = h }
+						end
+					end
+				end
+			end
+		end
+		table.sort(out, function(a, b) return a.dist < b.dist end)
+		return out
+	end
+
+	-- 打一个目标（照参考源码的协议）
+	function CX_RAGE.Hit(tool, target)
+		local char = LocalPlayer.Character
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		if not (hrp and target.part) then return false end
+
+		local muzzle = hrp.Position + Vector3.new(0, 2, 0)
+		local hitPos = target.part.Position
+		local dir = (hitPos - muzzle).Unit
+		local id = nuid()
+		local cf = compress(CFrame.lookAlong(muzzle, dir))
+
+		-- 本地扣弹药 + 同步 UI
+		if tool.toolState then
+			tool.toolState.ammo = math.max(0, (tool.toolState.ammo or 0) - 1)
+			setAmmo(tool)
+		end
+
+		-- ① 告诉服务端"我开枪了"
+		Network.InvokeServer("shoot", tool:GetId(), cf, { { id, cf } })
+
+		-- ② 告诉服务端"子弹打中了"（服务端认这个 hitData）
+		Network.FireServer("registerProjectileHits", id, tool:GetId(), {
+			{
+				normal = -dir, direction = dir,
+				hitName = CX_RAGE.Part,
+				source = "Bullet",
+				userId = target.player.UserId,
+				massLimit = 5,
+				ownerId = LocalPlayer.UserId,
+				position = hitPos,
+				processedPlayerId = LocalPlayer.UserId,
+				hit = target.part,
+				speed = (tool.projectile and tool.projectile.muzzleVelocity) or 300,
+				collisionPoint = hitPos,
+				material = Enum.Material.Plastic,
+				hitType = "player",
+			}
+		})
+		CX_RAGE.Shots = CX_RAGE.Shots + 1
+
+		-- 弹道绘制
+		if CX_RAGE.Tracer and FL_TRACER and FL_TRACER.Spawn then
+			pcall(FL_TRACER.Spawn, muzzle, hitPos)
+		end
+		return true
+	end
+
+	function CX_RAGE.Step()
+		if not CX_RAGE.Enabled then return end
+		local tool = ClientTools and ClientTools.GetLocalEquippedTool
+			and ClientTools.GetLocalEquippedTool()
+		if not tool or type(tool.GetId) ~= "function" or not tool.toolState then
+			CX_RAGE.LastErr = "手上没有武器"
+			return
+		end
+		if (tool.toolState.ammo or 0) <= 0 then
+			reload(tool)
+			return
+		end
+		local targets = CX_RAGE.Targets()
+		if #targets == 0 then
+			CX_RAGE.LastErr = "范围内没有目标"
+			return
+		end
+		local n = 0
+		for _, t in ipairs(targets) do
+			if n >= CX_RAGE.MaxTargets then break end
+			if (tool.toolState.ammo or 0) <= 0 then break end
+			if pcall(CX_RAGE.Hit, tool, t) then
+				n = n + 1
+				CX_RAGE.LastErr = nil
+			end
+			task.wait(0.03)
+		end
+	end
+
+	function CX_RAGE.Set(on)
+		CX_RAGE.Enabled = on and true or false
+		if CX_RAGE._conn then
+			CX_RAGE._conn:Disconnect()
+			CX_RAGE._conn = nil
+		end
+		if not CX_RAGE.Enabled then return end
+		CX_RAGE._conn = RunService.Heartbeat:Connect(function()
+			if not CX_RAGE.Enabled then return end
+			local now = os.clock()
+			if now - (CX_RAGE._last or 0) < CX_RAGE.Interval then return end
+			CX_RAGE._last = now
+			pcall(CX_RAGE.Step)
+		end)
+	end
+
+	function CX_RAGE.Status()
+		return string.format("RageBot=%s 范围=%.0f 部位=%s | 开火 %d | 目标 %d | %s",
+			tostring(CX_RAGE.Enabled), CX_RAGE.Range, CX_RAGE.Part,
+			CX_RAGE.Shots, #CX_RAGE.Targets(), tostring(CX_RAGE.LastErr or "ok"))
+	end
+end
+
+-- ==================================================================
+--  枪械（CX_WPN）—— 无限子弹 / 射速 / 射程
+--
+--  dump 依据：
+--  ① 弹药字段在 `tool.toolState` 上（`ClientGun` / `ClientGun.Input`）：
+--        tool.toolState.ammo        当前弹匣
+--        tool.toolState.totalAmmo   备弹（⭐ dump 里有 `totalAmmo == -1` 的判断 ⇒ -1 = 无限）
+--        tool.toolState.isInfinite  无限标记
+--        tool.ammoData.magSize      弹匣容量
+--        EquippedScreen:SetAmmo(ammo, totalAmmo, isInfinite)   ← 同步 UI
+--     换弹：Network.FireServer("reload", toolId) / ("chamber", toolId)
+--
+--  ② ⭐ **子弹弹道完全由客户端算**（`ClientProjectile.Projectiles.Bullet`）：
+--        num3.startVelocity = StudsFromMeters(trajectoryData.velocity * BulletTimeRatio)
+--        ... 客户端自己 Raycast ...
+--        FireServer("registerProjectileHits", projectileId, toolId, list2)
+--     ⇒ **射程 / 射速 都是客户端决定的**，服务端只收结果。
+--       （`rpm` 字段全是载具的；枪的射速字段叫 `fireRate`。）
+--
+--  ③ 所以真正"无限"的做法 = 直接伪造命中（见 `CX_RAGE`）—— 它绕过弹药/射速/射程所有检查。
+--     本引擎负责**本地弹药常满 + UI 显示 ∞ + 秒换弹**，配合 CX_RAGE 用。
+-- ==================================================================
+do
+	local RunService = game:GetService("RunService")
+	local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+	CX_WPN = CX_WPN or {}
+	CX_WPN.InfiniteAmmo = false
+	CX_WPN.InstantReload = true
+	CX_WPN.TopUpRate = 0.1     -- 补弹间隔（秒）
+	CX_WPN.Filled = 0
+	CX_WPN.LastErr = nil
+	CX_WPN._conn = nil
+	CX_WPN._last = 0
+
+	local Devv, Network, ClientTools, EquippedScreen
+	pcall(function()
+		Devv = require(ReplicatedStorage.Devv)
+		Network       = Devv.load("Network")
+		ClientTools   = Devv.load("ClientTools")
+		EquippedScreen= Devv.load("EquippedScreen")
+	end)
+
+	local function equipped()
+		if ClientTools and ClientTools.GetLocalEquippedTool then
+			local ok, t = pcall(ClientTools.GetLocalEquippedTool)
+			if ok then return t end
+		end
+		return nil
+	end
+
+	-- 把弹匣补满、备弹设 -1（dump 里 -1 就是无限），并同步 UI
+	function CX_WPN.Fill(tool)
+		local st = tool and tool.toolState
+		if not st then return false end
+		local mag = (tool.ammoData and tool.ammoData.magSize) or 30
+		st.ammo = mag
+		st.totalAmmo = -1
+		st.isInfinite = true
+		if EquippedScreen and EquippedScreen.SetAmmo then
+			pcall(function() EquippedScreen:SetAmmo(mag, -1, true) end)
+		end
+		CX_WPN.Filled = CX_WPN.Filled + 1
+		return true
+	end
+
+	-- 秒换弹（照游戏自己的两个包）
+	function CX_WPN.Reload()
+		local tool = equipped()
+		if not tool or type(tool.GetId) ~= "function" then return false end
+		if not (Network and Network.FireServer) then return false end
+		pcall(function()
+			Network.FireServer("reload", tool:GetId())
+			Network.FireServer("chamber", tool:GetId())
+		end)
+		if CX_WPN.InfiniteAmmo then pcall(CX_WPN.Fill, tool) end
+		return true
+	end
+
+	function CX_WPN.Step()
+		local tool = equipped()
+		if not tool or not tool.toolState then
+			CX_WPN.LastErr = "手上没有武器"
+			return
+		end
+		if CX_WPN.InfiniteAmmo then
+			pcall(CX_WPN.Fill, tool)
+		end
+		if CX_WPN.InstantReload and (tool.toolState.ammo or 0) <= 0 then
+			pcall(CX_WPN.Reload)
+		end
+		CX_WPN.LastErr = nil
+	end
+
+	function CX_WPN.Set(on)
+		CX_WPN.InfiniteAmmo = on and true or false
+		if CX_WPN._conn then
+			CX_WPN._conn:Disconnect()
+			CX_WPN._conn = nil
+		end
+		if not CX_WPN.InfiniteAmmo then return end
+		CX_WPN._conn = RunService.Heartbeat:Connect(function()
+			if not CX_WPN.InfiniteAmmo then return end
+			local now = os.clock()
+			if now - CX_WPN._last < CX_WPN.TopUpRate then return end
+			CX_WPN._last = now
+			pcall(CX_WPN.Step)
+		end)
+	end
+
+	function CX_WPN.Status()
+		local tool = equipped()
+		local st = tool and tool.toolState
+		return string.format("无限子弹=%s 秒换弹=%s | 弹匣 %s/%s 无限标记=%s | 补弹 %d 次 | %s",
+			tostring(CX_WPN.InfiniteAmmo), tostring(CX_WPN.InstantReload),
+			tostring(st and st.ammo), tostring(st and st.totalAmmo),
+			tostring(st and st.isInfinite), CX_WPN.Filled,
+			tostring(CX_WPN.LastErr or "ok"))
+	end
 end
 
 -- ===================================================================
@@ -559,8 +913,15 @@ do
 
 	CX_FLY = CX_FLY or {}
 	CX_FLY.Enabled       = false
-	CX_FLY.Speed         = 60
-	CX_FLY.VertSpeed     = 40
+	CX_FLY.Speed         = 30       -- ⚠️ 降速：太快会被服务端拉回
+	CX_FLY.VertSpeed     = 22
+	CX_FLY.Anchor        = true     -- ⭐ 定身：PlatformStand + 禁用 Humanoid 状态（悬浮不落地）
+	CX_FLY.Adaptive      = true     -- ⭐ 被拉回就自动降速
+	CX_FLY.MinStep       = 0.4      -- 自适应下限
+	CX_FLY.Pullbacks     = 0        -- ⭐ 检测到"被拉回"的次数（这就是答案）
+	CX_FLY.Reports       = 0        -- 平台上报次数
+	CX_FLY._lastTarget   = nil
+	CX_FLY._lastReport   = 0
 	CX_FLY.MaxStep       = 8      -- 单帧位移上限
 	CX_FLY.ReportRate    = 0.2    -- 上报间隔（和游戏一致）
 	CX_FLY.PlatformRange = 250    -- 找平台的范围
@@ -629,6 +990,18 @@ do
 		local hrp = char:FindFirstChild("HumanoidRootPart")
 		if not hrp then CX_FLY.LastErr = "没有 HRP" return end
 
+		-- ⭐ 被拉回检测：上一帧我们写到哪儿，这一帧还在不在那儿
+		if CX_FLY._lastTarget then
+			local drift = (hrp.Position - CX_FLY._lastTarget).Magnitude
+			-- 我们自己这一帧还没动，正常漂移应该很小（重力/摩擦）
+			if drift > math.max(3, CX_FLY.MaxStep) then
+				CX_FLY.Pullbacks = CX_FLY.Pullbacks + 1
+				if CX_FLY.Adaptive then
+					CX_FLY.MaxStep = math.max(CX_FLY.MinStep, CX_FLY.MaxStep * 0.8)
+				end
+			end
+		end
+
 		local dir = moveDir(hrp)
 		local vertical = 0
 		-- 上升/下降：优先 UI 开关（手机可用），键盘 Space/Ctrl 作为补充
@@ -651,6 +1024,7 @@ do
 		local ok = pcall(function() hrp.CFrame = hrp.CFrame + step end)
 		if not ok then CX_FLY.LastErr = "写 CFrame 失败" return end
 		CX_FLY.Steps = CX_FLY.Steps + 1
+		CX_FLY._lastTarget = hrp.Position
 
 		-- ② 照游戏的方式上报偏移（服务端据此认下这个位置）
 		if not CX_FLY.UsePlatform then return end
@@ -692,6 +1066,17 @@ do
 			CX_FLY._conn = nil
 		end
 		if not CX_FLY.Enabled then
+			-- 还原定身
+			if CX_FLY.Anchor then
+				pcall(function()
+					local char = LocalPlayer.Character
+					local hum = char and char:FindFirstChildOfClass("Humanoid")
+					if hum then
+						hum.PlatformStand = false
+						hum:ChangeState(Enum.HumanoidStateType.Running)
+					end
+				end)
+			end
 			-- 退出时照游戏的做法清一次
 			pcall(function()
 				local net = CX_META and CX_META.Network
@@ -702,6 +1087,17 @@ do
 			CX_FLY.Platform = nil
 			return
 		end
+		-- ⭐ 定身：PlatformStand 让角色悬浮（不落地、不受重力影响）
+		if CX_FLY.Anchor then
+			pcall(function()
+				local char = LocalPlayer.Character
+				local hum = char and char:FindFirstChildOfClass("Humanoid")
+				if hum then
+					hum.PlatformStand = true
+					hum:ChangeState(Enum.HumanoidStateType.Physics)
+				end
+			end)
+		end
 		CX_FLY._conn = RunService.RenderStepped:Connect(function(dt)
 			if CX_FLY.Enabled then
 				pcall(CX_FLY.Step, dt)
@@ -710,10 +1106,173 @@ do
 	end
 
 	function CX_FLY.Status()
-		return string.format("飞行=%s 平台通道=%s 平台=%s | 位移=%d 上报=%d\n方向读 Humanoid.MoveDirection（手机/手柄/键盘通用） | %s",
-			tostring(CX_FLY.Enabled), tostring(CX_FLY.UsePlatform),
+		return string.format("飞行=%s 定身=%s 平台通道=%s 平台=%s\n位移=%d 上报=%d ★被拉回=%d 当前单帧上限=%.2f\n%s",
+			tostring(CX_FLY.Enabled), tostring(CX_FLY.Anchor), tostring(CX_FLY.UsePlatform),
 			tostring(CX_FLY.Platform and CX_FLY.Platform.Name or "无"),
-			CX_FLY.Steps, CX_FLY.Reports, tostring(CX_FLY.LastErr or "ok"))
+			CX_FLY.Steps, CX_FLY.Reports, CX_FLY.Pullbacks, CX_FLY.MaxStep,
+			tostring(CX_FLY.LastErr or "ok"))
+	end
+end
+
+-- ==================================================================
+--  载具飞行（CX_VFLY）—— ⭐ 不限速
+--
+--  ⭐⭐ 为什么这个不限速（`DevvChassis.RotorChassis.FlightModel` 原文）：
+--      function value._updatePhysics(p3, p4)          -- p3 = RotorChassis 实例
+--          local model = p3.model:FindFirstChild("Chassis")
+--          ...
+--          local vec = 方向 * (p3.pitch * p3.mass * p3.acceleration)
+--                    + Vector3.new(0, p3.mass * workspace.Gravity * ..., 0)
+--          model.VectorForce.Force = model.CFrame:VectorToObjectSpace(value4)   -- ★ 客户端写
+--          model.DragForce.Force   = num6                                       -- ★ 客户端写
+--          ...
+--      end
+--      ⇒ **载具（直升机）的物理是客户端权威的** —— 客户端自己算力、自己写
+--        `Chassis.VectorForce` / `Chassis.DragForce`，**服务端不做速度校验**。
+--      ⇒ 所以我们直接改这两个 Force 就能不限速飞（把 DragForce 清零 = 去掉阻力上限）。
+--
+--  ⚠️ 前提：**你得坐在载具里**（直升机 / 车都行 —— 车同样有 Chassis）。
+--     走路时角色本身是服务端权威的，那条路走不通（就是之前被拉回的原因）。
+--
+--  和 CX_FLY（平台通道）的区别：
+--     CX_FLY  = 角色飞行，走"平台偏移上报"，**有速度上限**（会被拉回）
+--     CX_VFLY = 载具飞行，直接写载具的力，**没有速度上限** ✅
+-- ==================================================================
+do
+	local Players = game:GetService("Players")
+	local RunService = game:GetService("RunService")
+	local UIS = game:GetService("UserInputService")
+	local LocalPlayer = Players.LocalPlayer
+	local Camera = workspace.CurrentCamera
+
+	CX_VFLY = CX_VFLY or {}
+	CX_VFLY.Enabled  = false
+	CX_VFLY.Thrust   = 400000   -- 前进推力（Force 单位）
+	CX_VFLY.Lift     = 250000   -- 升力
+	CX_VFLY.KillDrag = true     -- ⭐ 把 DragForce 清零（这是"限速"的来源）
+	CX_VFLY.KeepUpright = true  -- 保持水平（写 Stabilizer 力矩为 0）
+	CX_VFLY.Found    = nil      -- 找到的 Chassis
+	CX_VFLY.Steps    = 0
+	CX_VFLY.LastErr  = nil
+	CX_VFLY._conn    = nil
+
+	local function key(k)
+		local ok, d = pcall(function() return UIS:IsKeyDown(k) end)
+		return ok and d
+	end
+
+	-- 从"我坐的座位"往上找带 Chassis 的模型
+	function CX_VFLY.FindChassis()
+		local char = LocalPlayer.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		local seat = hum and hum.SeatPart
+		if not seat then return nil end
+		local node = seat
+		for _ = 1, 6 do
+			node = node.Parent
+			if not node then break end
+			local ch = node:FindFirstChild("Chassis")
+			if ch and ch:IsA("BasePart") then return ch end
+		end
+		-- 兜底：workspace 里找名字带 Chassis 的部件
+		local ok, found = pcall(function()
+			for _, d in ipairs(workspace:GetDescendants()) do
+				if d.Name == "Chassis" and d:IsA("BasePart") then
+					local seat2 = hum.SeatPart
+					if seat2 and (d.Position - seat2.Position).Magnitude < 60 then
+						return d
+					end
+				end
+			end
+		end)
+		return ok and found or nil
+	end
+
+	function CX_VFLY.Step()
+		local chassis = CX_VFLY.Found
+		if not (chassis and chassis.Parent) then
+			chassis = CX_VFLY.FindChassis()
+			CX_VFLY.Found = chassis
+		end
+		if not chassis then
+			CX_VFLY.LastErr = "没坐在载具里（要先进直升机/车）"
+			return
+		end
+
+		-- 方向：读游戏自己的 MoveDirection（手机/手柄/键盘通吃）+ 相机
+		local char = LocalPlayer.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		local md = hum and hum.MoveDirection
+		local cf = Camera and Camera.CFrame
+		local dir = Vector3.new(0, 0, 0)
+		if md and md.Magnitude > 0.01 and cf then
+			local look = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z)
+			local right = Vector3.new(cf.RightVector.X, 0, cf.RightVector.Z)
+			if look.Magnitude < 1e-4 then look = Vector3.new(0, 0, -1) end
+			if right.Magnitude < 1e-4 then right = Vector3.new(1, 0, 0) end
+			dir = (look.Unit * -md.Z + right.Unit * md.X)
+		end
+
+		local up = 0
+		if CX_VFLY.Up then up = up + 1 end
+		if CX_VFLY.Down then up = up - 1 end
+		if key(Enum.KeyCode.Space) then up = up + 1 end
+		if key(Enum.KeyCode.LeftControl) or key(Enum.KeyCode.LeftShift) then up = up - 1 end
+
+		local force = Vector3.new(0, 0, 0)
+		if dir.Magnitude > 0 then
+			force = force + dir.Unit * CX_VFLY.Thrust
+		end
+		force = force + Vector3.new(0, up * CX_VFLY.Lift, 0)
+		-- 悬停：没输入也给一点升力抵消重力（载具质量未知，给个固定值，调不准就手动加）
+		if up == 0 and dir.Magnitude <= 0 then
+			force = Vector3.new(0, 0, 0)
+		end
+
+		-- ⭐ 直接写载具的力（这是客户端权威的）
+		local vf = chassis:FindFirstChild("VectorForce")
+		if vf and vf:IsA("VectorForce") then
+			pcall(function() vf.Force = force end)
+		end
+		if CX_VFLY.KillDrag then
+			local df = chassis:FindFirstChild("DragForce")
+			if df and df:IsA("VectorForce") then
+				pcall(function() df.Force = Vector3.new(0, 0, 0) end)
+			end
+		end
+		if CX_VFLY.KeepUpright then
+			local st = chassis:FindFirstChild("Stabilizer")
+			if st and st:IsA("AlignOrientation") then
+				pcall(function() st.MaxTorque = Vector3.new(0, 0, 0) end)
+			end
+		end
+		CX_VFLY.Steps = CX_VFLY.Steps + 1
+		CX_VFLY.LastErr = nil
+	end
+
+	function CX_VFLY.Set(on)
+		CX_VFLY.Enabled = on and true or false
+		if CX_VFLY._conn then
+			CX_VFLY._conn:Disconnect()
+			CX_VFLY._conn = nil
+		end
+		if not CX_VFLY.Enabled then
+			CX_VFLY.Found = nil
+			return
+		end
+		CX_VFLY._conn = RunService.RenderStepped:Connect(function()
+			if CX_VFLY.Enabled then
+				pcall(CX_VFLY.Step)
+			end
+		end)
+	end
+
+	function CX_VFLY.Status()
+		return string.format("载具飞行=%s 底盘=%s | 推力=%.0f 升力=%.0f 去阻力=%s | 步数=%d | %s",
+			tostring(CX_VFLY.Enabled),
+			tostring(CX_VFLY.Found and CX_VFLY.Found:GetFullName() or "没找到"),
+			CX_VFLY.Thrust, CX_VFLY.Lift, tostring(CX_VFLY.KillDrag),
+			CX_VFLY.Steps, tostring(CX_VFLY.LastErr or "ok"))
 	end
 end
 
@@ -1290,6 +1849,1284 @@ local function playWelcome(callback)
 end
 
 
+-- ===================================================================
+--  绘制库（by 思绪）· 内嵌通用版 —— ⭐ 这就是"之前的 ESP 模板库"
+--  原版外观：完整方框 PurpleLight(210,180,255) 描边 + 框内 PurpleMid(170,120,255) 填充
+-- ===================================================================
+local ESP = (function()
+----by思绪 空闲小作
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace         = game:GetService("Workspace")
+local CoreGui           = game:GetService("CoreGui")
+local HttpService       = game:GetService("HttpService")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera      = Workspace.CurrentCamera
+local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
+
+local Theme = {
+    PurpleLight = Color3.fromRGB(210, 180, 255),
+    PurpleMid   = Color3.fromRGB(170, 120, 255),
+    PurpleDeep  = Color3.fromRGB(120,  70, 220),
+    PurpleSoft  = Color3.fromRGB(235, 220, 255),
+    PurpleGlow  = Color3.fromRGB(180, 140, 255),
+    White       = Color3.fromRGB(255, 255, 255),
+    Black       = Color3.fromRGB(0, 0, 0),
+    DarkBg      = Color3.fromRGB(22, 22, 28),
+}
+
+local ESP_CustomFonts = nil
+do
+    local ok = pcall(function()
+        local Fonts = {}
+        local function FontsRegister(Name, Weight, Style, Asset)
+            if not isfile(Asset.Id) then
+                writefile(Asset.Id, Asset.Font)
+            end
+            if isfile(Name .. ".font") then
+                delfile(Name .. ".font")
+            end
+            local Info = {
+                name = Name,
+                faces = {
+                    {
+                        name = "Normal",
+                        weight = Weight,
+                        style = Style,
+                        assetId = getcustomasset(Asset.Id),
+                    },
+                },
+            }
+            writefile(Name .. ".font", HttpService:JSONEncode(Info))
+            return getcustomasset(Name .. ".font")
+        end
+-----这是我偷懒的一部分
+        Fonts.Tahoma = FontsRegister("Tahoma", 400, "Normal", {
+            Id = "Tahoma.ttf",
+            Font = game:HttpGet("https://github.com/i77lhm/storage/raw/refs/heads/main/fonts/fs-tahoma-8px.ttf"),
+        })
+        Fonts.XPTahoma = FontsRegister("XPTahoma", 400, "Normal", {
+            Id = "Tahoma8PTBOLD.ttf",
+            Font = game:HttpGet("https://github.com/sametexe001/luas/raw/refs/heads/main/fonts/TAHOMA-8PT-BOLD-WINDOWS-XP.TTF"),
+        })
+        Fonts.SmallestPixel = FontsRegister("SmallestPixel", 400, "Normal", {
+            Id = "smallest_pixel-7.ttf",
+            Font = game:HttpGet("https://raw.githubusercontent.com/sametexe001/luas/main/smallest_pixel-7.ttf")
+        })
+        Fonts.ProggyTiny = FontsRegister("ProggyTiny", 400, "Normal", {
+            Id = "ProggyTinyyyy.ttf",
+            Font = game:HttpGet("https://github.com/i77lhm/storage/raw/refs/heads/main/fonts/ProggyTiny.ttf")
+        })
+        Fonts.ProggyClean = FontsRegister("ProggyClean", 400, "Normal", {
+            Id = "ProggyClean.ttf",
+            Font = game:HttpGet("https://github.com/i77lhm/storage/raw/main/fonts/ProggyClean.ttf"),
+        })
+
+        ESP_CustomFonts = {
+            TahomaBold    = Font.new(Fonts.XPTahoma,     Enum.FontWeight.Regular, Enum.FontStyle.Normal),
+            Tahoma        = Font.new(Fonts.Tahoma,       Enum.FontWeight.Regular, Enum.FontStyle.Normal),
+            SmallestPixel = Font.new(Fonts.SmallestPixel,Enum.FontWeight.Regular, Enum.FontStyle.Normal),
+            ProggyTiny    = Font.new(Fonts.ProggyTiny,   Enum.FontWeight.Regular, Enum.FontStyle.Normal),
+            ProggyClean   = Font.new(Fonts.ProggyClean,  Enum.FontWeight.Regular, Enum.FontStyle.Normal),
+        }
+    end)
+    if not ok or not ESP_CustomFonts then
+        ESP_CustomFonts = {
+            TahomaBold    = { Font = Enum.Font.GothamBold },
+            Tahoma        = { Font = Enum.Font.Gotham },
+            SmallestPixel = { Font = Enum.Font.Code },
+            ProggyTiny    = { Font = Enum.Font.Code },
+            ProggyClean   = { Font = Enum.Font.Code },
+        }
+    end
+end
+
+local Flags = setmetatable({}, {
+    __index = function(t, k)
+        local v = { Value=false, Color=Theme.PurpleLight, Transparency=0 }
+        rawset(t, k, v)
+        return v
+    end
+})
+
+local function setFlag(name, data) Flags[name] = data end
+
+setFlag("Esp Box",               {Value=true})
+setFlag("Esp Box Style",         {Value="Full"})   -- [改造] Full / Corners
+setFlag("Esp Box Thickness",     {Value=2})
+setFlag("Esp Box Color",         {Color=Theme.PurpleLight})
+setFlag("Esp Box Fill",          {Value=true})
+setFlag("Esp Box Fill Color",    {Color=Theme.PurpleMid})
+setFlag("Esp Box Fill Transparency", {Value=0.55})
+setFlag("Esp Box Fill Spin",     {Value=false})
+setFlag("Esp Box Glow",          {Value=false})
+
+setFlag("Esp Health Bar",        {Value=true})
+setFlag("Esp Health Color 1",    {Color=Color3.fromRGB(255, 255, 255)})
+setFlag("Esp Health Color 2",    {Color=Theme.PurpleLight})
+setFlag("Esp Health Color 3",    {Color=Color3.fromRGB(255, 255, 255), Transparency=0})
+setFlag("Esp Health Bar Type",   {Value="Gradient"})
+
+setFlag("Esp Name",              {Value=true})
+setFlag("Esp Name Font",         {Value="Bold"})
+setFlag("Esp Name Color",        {Color=Theme.PurpleSoft, Transparency=0})
+
+setFlag("Esp Weapon",            {Value=true})
+setFlag("Esp Weapon Color",      {Color=Theme.PurpleSoft, Transparency=0})
+setFlag("Esp Weapon Icon",       {Value=true})
+setFlag("Esp Weapon Icon Color", {Color=Theme.White, Transparency=0})
+
+setFlag("Esp Distance",          {Value=true})
+setFlag("Esp Distance Color",    {Color=Theme.PurpleSoft, Transparency=0})
+
+setFlag("Esp Skeleton",          {Value=false})
+setFlag("Esp Skeleton Color",    {Color=Theme.PurpleMid, Transparency=0})
+
+setFlag("Esp Flags",             {Value=true})
+setFlag("Esp Flags Color",       {Color=Theme.PurpleSoft, Transparency=0})
+
+setFlag("Esp Refresh Rate",      {Value=144})
+setFlag("Esp Bounding Type",     {Value="Static"})
+setFlag("Esp Max Distance",      {Value=1500})
+setFlag("Esp Priority Only",     {Value=false})
+
+setFlag("Esp Oov",               {Value=false})
+setFlag("Esp Oov Color",         {Color=Theme.PurpleLight, Transparency=0})
+setFlag("Esp Oov Elements",      {Value={"Name","Health Bar","Distance","Weapon"}})
+setFlag("Esp Oov Style",         {Value="Concave"})
+setFlag("Esp Oov Distance",      {Value=40})
+setFlag("Esp Oov Size",          {Value=13})
+setFlag("Esp Oov Dynamic Distance", {Value=false})
+setFlag("Esp Oov Dynamic Size",  {Value=false})
+setFlag("Esp Oov Blink",         {Value=false})
+setFlag("Esp Oov Blink Speed",   {Value=1})
+
+setFlag("Chams Enabled",         {Value=false})
+setFlag("Chams Color",           {Color=Theme.PurpleDeep, Transparency=0.61})
+setFlag("Outline Color",         {Color=Theme.PurpleLight, Transparency=0.21})
+setFlag("Glows Enabled",         {Value=false})
+setFlag("Glows Size",            {Value=1.75})
+setFlag("Chams Shading",         {Value=false})
+setFlag("Inline Shade",          {Value="Default"})
+setFlag("Outline Shade",         {Value="Default"})
+
+setFlag("Priority Color Enabled",{Value=true})
+setFlag("Priority Color",        {Color=Theme.PurpleLight})
+setFlag("Whitelist Color Enabled",{Value=true})
+setFlag("Whitelist Color",       {Color=Theme.PurpleSoft})
+
+
+-- [改造] 原库靠游戏 Items 模块填充图标，本项目无此模块，留空表即可
+local ItemIcons = {}
+
+local BodyPartNames = {
+    "Head","UpperTorso","LowerTorso",
+    "RightUpperArm","RightLowerArm","RightHand",
+    "LeftUpperArm","LeftLowerArm","LeftHand",
+    "RightUpperLeg","RightLowerLeg","RightFoot",
+    "LeftUpperLeg","LeftLowerLeg","LeftFoot",
+}
+local BodyPartSizes = {
+    ["Head"]          = Vector3.new(2,1.3,1),
+    ["UpperTorso"]    = Vector3.new(2,1.6,1),
+    ["LowerTorso"]    = Vector3.new(2,0.4,1),
+    ["RightUpperArm"] = Vector3.new(1,1.169,1),
+    ["RightLowerArm"] = Vector3.new(1,1.052,1),
+    ["LeftUpperArm"]  = Vector3.new(1,1.169,1),
+    ["LeftLowerArm"]  = Vector3.new(1,1.052,1),
+    ["RightHand"]     = Vector3.new(1,0.3,1),
+    ["LeftHand"]      = Vector3.new(1,0.3,1),
+    ["RightUpperLeg"] = Vector3.new(1,1.127,1),
+    ["RightLowerLeg"] = Vector3.new(1,1.193,1),
+    ["RightFoot"]     = Vector3.new(1,0.3,1),
+    ["LeftUpperLeg"]  = Vector3.new(1,1.127,1),
+    ["LeftLowerLeg"]  = Vector3.new(1,1.193,1),
+    ["LeftFoot"]      = Vector3.new(1,0.3,1),
+}
+local SkeletonJoints = {
+    {"Head","UpperTorso"},{"UpperTorso","LowerTorso"},
+    {"UpperTorso","LeftUpperArm"},{"LeftUpperArm","LeftLowerArm"},{"LeftLowerArm","LeftHand"},
+    {"UpperTorso","RightUpperArm"},{"RightUpperArm","RightLowerArm"},{"RightLowerArm","RightHand"},
+    {"LowerTorso","LeftUpperLeg"},{"LeftUpperLeg","LeftLowerLeg"},{"LeftLowerLeg","LeftFoot"},
+    {"LowerTorso","RightUpperLeg"},{"RightUpperLeg","RightLowerLeg"},{"RightLowerLeg","RightFoot"},
+}
+
+
+local ESP = {}
+-- [改造] 宿主可配置的开关与注入点
+ESP.Theme        = Theme   -- [改造] 暴露主题色，供宿主复位到原版外观
+ESP.Enabled      = true    -- 总开关
+ESP.ShowDead     = false   -- 是否显示已死亡玩家
+ESP.TrackSelf    = false   -- 是否显示自己
+ESP.TeamCheck    = false   -- 是否忽略队友
+ESP.TeamResolver = nil     -- 注入: function(player) -> isTeammate
+ESP.ColorResolver = nil    -- 注入: function(player) -> Color3?（按玩家覆盖 ESP 颜色 → 敌我分色）
+ESP.NameResolver = nil     -- 注入: function(player) -> 显示名（默认 player.Name）
+ESP.WeaponResolver = nil   -- 注入: function(player) -> 武器对象（需有 .Name 字段）or nil
+ESP.ItemIcons    = ItemIcons -- [改造] 暴露武器图标表（武器名 -> 图片 id），宿主可自行填充
+-- 注入: function(character) -> { root=BasePart, humanoid=Humanoid?, health, maxHealth, alive }
+-- 用于血量 / 存活状态不走 Humanoid 的游戏（如用 Attribute 存血量的游戏）
+ESP.CharResolver = nil
+ESP.Camera      = Camera
+ESP.ScreenSize  = Camera.ViewportSize
+ESP.LocalPlayer = LocalPlayer
+ESP.Flags       = {}
+ESP.Overlay     = nil
+
+ESP.Fonts = {
+    ["Tiny5"]         = { FontObject = ESP_CustomFonts.SmallestPixel, Size = 8  },
+    ["Sevasto"]       = { FontObject = ESP_CustomFonts.Tahoma,        Size = 14 },
+    ["Tahoma"]        = { FontObject = ESP_CustomFonts.Tahoma,        Size = 12 },
+    ["Tahoma Bold"]   = { FontObject = ESP_CustomFonts.TahomaBold,    Size = 9  },
+    ["Consolas Bold"] = { FontObject = ESP_CustomFonts.ProggyTiny,    Size = 11 },
+}
+
+function ESP.DeepCopy(t)
+    local c = {}
+    for k,v in next, t do c[k] = type(v)=="table" and ESP.DeepCopy(v) or v end
+    return c
+end
+
+local function ApplyFont(Obj, FontSpec)
+    if not FontSpec then
+        Obj.Font = Enum.Font.Code
+        return
+    end
+    local FO = FontSpec.FontObject
+    if FO == nil then
+        if typeof(FontSpec) == "Font" then
+            Obj.FontFace = FontSpec
+        elseif FontSpec.Font then
+            Obj.Font = FontSpec.Font
+        else
+            Obj.Font = Enum.Font.Code
+        end
+        return
+    end
+    if typeof(FO) == "Font" then
+        Obj.FontFace = FO
+    elseif typeof(FO) == "table" and FO.Font then
+        Obj.Font = FO.Font
+    else
+        Obj.Font = Enum.Font.Code
+    end
+end
+
+function ESP.Render(Type, Properties, Drawing)
+    local IsText = Type=="TextLabel" or Type=="TextButton" or Type=="TextBox"
+    local R = Instance.new(Type)
+
+    if Type=="UIStroke" then
+        R.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual
+        R.LineJoinMode = Enum.LineJoinMode.Miter
+        R.Color = Theme.Black; R.Thickness = 1
+    elseif Type=="CylinderHandleAdornment" then
+        R.CFrame = CFrame.new(Vector3.zero, Vector3.new(0,90,0))
+    elseif IsText then
+        R.TextStrokeTransparency = 1
+    end
+
+    if Type ~= "UIStroke" and Properties["TextStrokeTransparency"] ~= nil then
+        local S = ESP.Render("UIStroke",{
+            Parent=R, Color=Properties.TextStrokeColor3,
+            LineJoinMode=Properties.LineJoinMode,
+            ApplyStrokeMode=Properties.ApplyStrokeMode,
+            Thickness=Properties.Thickness,
+            Transparency=Properties.TextStrokeTransparency,
+        })
+        if IsText then
+            R:GetPropertyChangedSignal("TextTransparency"):Connect(function()
+                S.Transparency = R.TextTransparency
+            end)
+        end
+    end
+
+    if IsText then
+        local F = Properties.FontObject or ESP.Fonts["Tiny5"]
+        pcall(function() ApplyFont(R, F) end)
+        R.TextSize = (F and F.Size) or 9
+        R.TextColor3 = Theme.White
+    end
+
+    for i,v in next, Properties do
+        if i=="FontObject" or i=="TextStrokeTransparency" or i=="FontFace" then continue end
+        R[i] = v
+    end
+
+    if IsText and Drawing=="Shadow" then
+        local Sh = ESP.Render("TextLabel", Properties)
+        Sh.Position = R.Position + UDim2.new(0,1,0,1)
+        Sh.TextColor3 = Theme.Black
+        Sh.ZIndex = R.ZIndex - 1; Sh.RichText = false
+        Sh.Text = R.ContentText
+        R:GetPropertyChangedSignal("Parent"):Connect(function() Sh.Parent=R.Parent end)
+        R:GetPropertyChangedSignal("Position"):Connect(function() Sh.Position=R.Position+UDim2.new(0,1,0,1) end)
+        R:GetPropertyChangedSignal("Visible"):Connect(function() Sh.Visible=R.Visible end)
+        R:GetPropertyChangedSignal("Text"):Connect(function() Sh.Text=R.ContentText end)
+        R:GetPropertyChangedSignal("TextTransparency"):Connect(function() Sh.TextTransparency=R.TextTransparency end)
+    end
+    return R
+end
+
+function ESP.Rotate(Vector, Radians)
+    local U = Vector.Unit
+    local sx, cx = math.sin(Radians), math.cos(Radians)
+    return Vector2.new((cx*U.X)-(sx*U.Y),(sx*U.X)+(cx*U.Y)).Unit * Vector.Magnitude
+end
+function ESP.MultiplyColor(C,R) return Color3.new(C.R*R,C.G*R,C.B*R) end
+function ESP.LerpColor(C1,C2,R) return Color3.new(C1.R+(C2.R-C1.R)*R,C1.G+(C2.G-C1.G)*R,C1.B+(C2.B-C1.B)*R) end
+function ESP.Lerp(Cur,Goal,G) return (1-G)*Cur + G*Goal end
+
+function ESP.Parent(Renders)
+    for Index, Render in next, Renders do
+        if Index=="Arrow" or Index=="ArrowOutline" or Index=="Skeleton" or Index=="Chams"
+            or Index=="CornerH" or Index=="CornerV" then
+            continue
+        elseif Index=="Flags" then
+            for _, V in next, Render do if V.Render then V.Render.Parent=nil end end
+        elseif typeof(Render)=="Instance" then
+            Render.Parent = nil
+        end
+    end
+end
+
+-- [改造] 投影改为 Roblox 原生接口，与 csgo 源码保持一致。
+-- 原手写投影只假设 FieldOfViewMode = Vertical；一旦视角模式是
+-- Horizontal / Diagonal / MaxAxis，或相机被游戏脚本接管，就会整体画歪。
+-- 原生接口自动适配所有模式，并正确处理 ViewportSize / GUI inset。
+function ESP.WorldToViewportPoint(Position)
+    local Cam = Workspace.CurrentCamera or ESP.Camera
+    if not Cam then return Vector3.new(0,0,0), false end
+    ESP.Camera = Cam
+    local V, On = Cam:WorldToViewportPoint(Position)
+    return Vector3.new(V.X, V.Y, V.Z), On
+end
+
+function ESP.GetBoundingBox(This, RootPosition, Type)
+    local SY = ESP.ScreenSize.Y
+    if Type == "Static" then
+        local P, On = ESP.WorldToViewportPoint(RootPosition)
+        if not On then return end
+        local Scale = (SY * 1.5) / (P.Z * 2 * math.tan((ESP.Camera.FieldOfView*math.pi/180)/2))
+        local W = 2.0833 * Scale
+        local H = 3.6364 * Scale
+        return UDim2.new(0, math.floor(P.X - W/2), 0, math.floor(P.Y - H/2.5)),
+               UDim2.new(0, math.ceil(W), 0, math.ceil(H))
+    else
+        local MinX,MinY = math.huge,math.huge
+        local MaxX,MaxY = -math.huge,-math.huge
+        local Any = false
+        for _, Part in next, This.BodyParts do
+            local CF, Sz = Part.CFrame, Part.Size
+            local hx,hy,hz = Sz.X/2, Sz.Y/2, Sz.Z/2
+            local C = {
+                Vector3.new(hx,hy,hz),Vector3.new(-hx,hy,hz),
+                Vector3.new(hx,-hy,hz),Vector3.new(-hx,-hy,hz),
+                Vector3.new(hx,hy,-hz),Vector3.new(-hx,hy,-hz),
+                Vector3.new(hx,-hy,-hz),Vector3.new(-hx,-hy,-hz),
+            }
+            for i=1,8 do
+                local P, On = ESP.WorldToViewportPoint(CF*C[i])
+                MinX=math.min(MinX,P.X); MinY=math.min(MinY,P.Y)
+                MaxX=math.max(MaxX,P.X); MaxY=math.max(MaxY,P.Y)
+                if On then Any = true end
+            end
+        end
+        if not Any then return end
+        MinX,MinY=math.floor(MinX),math.floor(MinY)
+        MaxX,MaxY=math.floor(MaxX),math.floor(MaxY)
+        return UDim2.new(0,MinX,0,MinY), UDim2.new(0,MaxX-MinX,0,MaxY-MinY)
+    end
+end
+
+local function CreateLine(Parent, ZIndex)
+    return ESP.Render("Frame", {
+        Parent = Parent,
+        BackgroundColor3 = Theme.PurpleLight,
+        BackgroundTransparency = 0,
+        BorderSizePixel = 0,
+        Visible = false,
+        ZIndex = ZIndex or 3,
+        AnchorPoint = Vector2.new(0, 0.5),
+    })
+end
+
+local function UpdateLine(Line, From, To, Color, Transparency)
+    local D = To - From
+    local Len = D.Magnitude
+    if Len <= 0.01 then
+        Line.Visible = false
+        return
+    end
+    Line.Position = UDim2.new(0, From.X, 0, From.Y)
+    Line.Size = UDim2.new(0, Len, 0, 1)
+    Line.Rotation = math.deg(math.atan2(D.Y, D.X))
+    Line.BackgroundColor3 = Color
+    Line.BackgroundTransparency = Transparency
+    Line.Visible = true
+end
+
+function ESP.GetPlayerRenders(Player)
+    local R = { Chams=ESP.GetChams(), Skeleton=ESP.GetSkeleton(), Flags={} }
+    R.RenderFrame = ESP.Render("Frame",{Visible=false,BackgroundTransparency=1})
+    R.ShadowName  = ESP.Render("TextLabel",{ZIndex=3,Visible=false,Position=UDim2.new(0.5,0,0,-9),Text=Player.Name,TextTransparency=0,BackgroundTransparency=1,FontObject=ESP.Fonts["Tahoma Bold"],RichText=true},"Shadow")
+    R.OutlineName = ESP.Render("TextLabel",{ZIndex=3,Visible=false,Position=UDim2.new(0.5,0,0,-9),Text=Player.Name,TextTransparency=0,TextStrokeTransparency=0,BackgroundTransparency=1,FontObject=ESP.Fonts["Tiny5"],RichText=true})
+    R.Distance    = ESP.Render("TextLabel",{ZIndex=3,Visible=false,Position=UDim2.new(0.5,0,1,7),TextTransparency=0,TextStrokeTransparency=0,BackgroundTransparency=1})
+    R.Weapon      = ESP.Render("TextLabel",{ZIndex=3,Visible=false,Position=UDim2.new(0.5,0,1,15),TextTransparency=0,TextStrokeTransparency=0,BackgroundTransparency=1})
+    R.WeaponIcon  = ESP.Render("ImageLabel",{ZIndex=2,Visible=false,Position=UDim2.new(0.5,-13,1,22),Size=UDim2.new(0,25,0,25),BackgroundTransparency=1,Image=""})
+    R.Box         = ESP.Render("Frame",{ZIndex=1,Visible=false,Position=UDim2.new(0,-1,0,-1),Size=UDim2.new(1,2,1,2),BackgroundTransparency=1})
+    -- [改造] Corners 模式所需的 4 组角线（每组一条横线 + 一条竖线）
+    R.CornerH = {}; R.CornerV = {}
+    for _i = 1, 4 do
+        R.CornerH[_i] = ESP.Render("Frame",{ZIndex=1,Visible=false,BorderSizePixel=0,BackgroundColor3=Theme.PurpleLight})
+        R.CornerV[_i] = ESP.Render("Frame",{ZIndex=1,Visible=false,BorderSizePixel=0,BackgroundColor3=Theme.PurpleLight})
+    end
+    R.BoxFill     = ESP.Render("Frame",{ZIndex=2,Visible=false,Position=UDim2.new(0,1,0,1),Size=UDim2.new(1,-2,1,-2),BackgroundTransparency=0,BorderSizePixel=0,BackgroundColor3=Theme.PurpleMid})
+    R.BoxFillGradient = ESP.Render("UIGradient",{Enabled=true,Rotation=90})
+    R.BoxOutline  = ESP.Render("UIStroke",{Thickness=3})
+    R.BoxInline   = ESP.Render("UIStroke",{LineJoinMode=Enum.LineJoinMode.Miter,Thickness=1,Color=Theme.PurpleLight})
+    R.Health         = ESP.Render("Frame",{ZIndex=4,Visible=false,Position=UDim2.new(0,-6,0,-2),Size=UDim2.new(0,1.5,1,4),BorderColor3=Theme.Black,BackgroundColor3=Theme.PurpleLight,BackgroundTransparency=0,BorderSizePixel=0})
+    R.HealthBack     = ESP.Render("Frame",{ZIndex=3,Visible=false,Position=UDim2.new(0,-6,0,-2),Size=UDim2.new(0,1.5,1,4),BorderColor3=Theme.Black,BackgroundColor3=Theme.DarkBg,BorderSizePixel=1})
+    R.HealthGradient = ESP.Render("UIGradient",{Enabled=true,Rotation=90})
+    R.HealthText     = ESP.Render("TextLabel",{ZIndex=5,Visible=false,AnchorPoint=Vector2.new(0,0.5),Position=UDim2.new(0,-8,1,0),Text="115",TextTransparency=0,TextStrokeTransparency=0,BackgroundTransparency=1})
+    R.OOVHolder = ESP.Render("Frame",{BackgroundTransparency=1,Visible=false,ZIndex=3})
+    R.OOVLeft   = CreateLine(R.OOVHolder, 3)
+    R.OOVRight  = CreateLine(R.OOVHolder, 3)
+    R.OOVMiddle = CreateLine(R.OOVHolder, 3)
+    return R
+end
+
+
+function ESP.GetChams()
+    local This = {}
+    local OO = Vector3.new(0.1,0.1,0.1)
+    local IO = Vector3.new(-0.1,-0.1,-0.1)
+    for Name, Value in next, BodyPartSizes do
+        local IsHead = (Name == "Head")
+        for i = 1, 2 do
+            local IsOutline = (i == 1)
+            local Offset = (IsOutline and 0.3 or 0.4)
+            local R = ESP.Render(IsHead and "CylinderHandleAdornment" or "BoxHandleAdornment",{
+                Parent=ESP.Overlay,
+                AlwaysOnTop = IsOutline and false or true,
+                ZIndex = IsOutline and -1 or 1,
+                Transparency = IsOutline and 0.21 or 0.61,
+                AdornCullingMode = Enum.AdornCullingMode.Never,
+            })
+            if IsHead then
+                R.Height = (Value.Y + 0.4) - Offset
+                R.Radius = (Value.X / 2) - Offset
+            else
+                R.Size = Value + (IsOutline and OO or IO)
+            end
+            This[#This+1] = {R, Name, IsOutline}
+        end
+    end
+    return This
+end
+
+function ESP.GetSkeleton()
+    local This = {}
+    for i = 1, #SkeletonJoints do
+        This[i] = CreateLine(nil, 3)
+    end
+    return This
+end
+
+local function GetPriorityColor(This)
+    -- [改造] 宿主按玩家注入的颜色优先（用于敌我分色）
+    if This.OverrideColor then return This.OverrideColor end
+    if This.Priority and Flags["Priority Color Enabled"].Value then
+        return Flags["Priority Color"].Color
+    elseif This.Whitelist and Flags["Whitelist Color Enabled"].Value then
+        return Flags["Whitelist Color"].Color
+    end
+    return nil
+end
+
+local function ComputeNameScale(This)
+    local target = 1 + math.clamp((This.Distance or 0) / 500, 0, 2.5)
+    if not This._SmoothNameScale then
+        This._SmoothNameScale = target
+    else
+        This._SmoothNameScale = ESP.Lerp(This._SmoothNameScale, target, 0.25)
+    end
+    return This._SmoothNameScale
+end
+
+function ESP.RenderPlayerOnScreen(This, R, BoxPos, BoxSize)
+    local RF = R.RenderFrame
+    local Box,BoxInline,BoxOutline,BoxFill,BoxFillGradient = R.Box,R.BoxInline,R.BoxOutline,R.BoxFill,R.BoxFillGradient
+    local HI,HO,HT,HG = R.Health,R.HealthBack,R.HealthText,R.HealthGradient
+    local SN,ON = R.ShadowName,R.OutlineName
+    local W,WI,D = R.Weapon,R.WeaponIcon,R.Distance
+    local SK = R.Skeleton
+    local P = GetPriorityColor(This)
+
+    R.OOVHolder.Visible=false
+    if RF.Parent ~= ESP.Overlay then RF.Parent = ESP.Overlay end
+
+    local targetX = BoxPos.X.Offset
+    local targetY = BoxPos.Y.Offset
+    local targetW = BoxSize.X.Offset
+    local targetH = BoxSize.Y.Offset
+
+    if not This._SmoothX then
+        This._SmoothX = targetX
+        This._SmoothY = targetY
+        This._SmoothW = targetW
+        This._SmoothH = targetH
+    else
+        local a = 0.45
+        This._SmoothX = ESP.Lerp(This._SmoothX, targetX, a)
+        This._SmoothY = ESP.Lerp(This._SmoothY, targetY, a)
+        This._SmoothW = ESP.Lerp(This._SmoothW, targetW, a)
+        This._SmoothH = ESP.Lerp(This._SmoothH, targetH, a)
+    end
+
+    BoxPos = UDim2.new(0, math.floor(This._SmoothX), 0, math.floor(This._SmoothY))
+    BoxSize = UDim2.new(0, math.floor(This._SmoothW), 0, math.floor(This._SmoothH))
+
+    RF.Position = BoxPos; RF.Size = BoxSize
+    RF.Visible = true
+
+    -- [改造] 支持 Full / Corners 两种方框模式
+    local _Corners = (Flags["Esp Box Style"].Value == "Corners")
+    for _i = 1, 4 do
+        if R.CornerH[_i] then
+            R.CornerH[_i].Visible = false; R.CornerV[_i].Visible = false
+        end
+    end
+    if Flags["Esp Box"].Value and _Corners then
+        local C = P or Flags["Esp Box Color"].Color
+        local _W, _H = BoxSize.X.Offset, BoxSize.Y.Offset
+        local _L = math.min(_W * 0.25, _H * 0.25, 12)
+        local _T = Flags["Esp Box Thickness"].Value
+        local _ox, _oy = BoxPos.X.Offset, BoxPos.Y.Offset
+        local _pts = {
+            {_ox,      _oy,      1,  1},
+            {_ox + _W, _oy,     -1,  1},
+            {_ox,      _oy + _H, 1, -1},
+            {_ox + _W, _oy + _H,-1, -1},
+        }
+        for _i = 1, 4 do
+            local _p = _pts[_i]
+            local _h, _v = R.CornerH[_i], R.CornerV[_i]
+            _h.Parent = RF; _v.Parent = RF
+            _h.BackgroundColor3 = C; _v.BackgroundColor3 = C
+            _h.Size = UDim2.new(0, _L, 0, _T)
+            _h.Position = UDim2.new(0, (_p[3] > 0) and _p[1] or (_p[1] - _L), 0, (_p[4] > 0) and _p[2] or (_p[2] - _T))
+            _v.Size = UDim2.new(0, _T, 0, _L)
+            _v.Position = UDim2.new(0, (_p[3] > 0) and _p[1] or (_p[1] - _T), 0, (_p[4] > 0) and _p[2] or (_p[2] - _L))
+            _h.Visible = true; _v.Visible = true
+        end
+        Box.Visible=false; Box.Parent=nil; BoxInline.Parent=nil; BoxOutline.Parent=nil
+        BoxFill.Visible=false; BoxFill.Parent=nil; BoxFillGradient.Parent=nil
+    elseif Flags["Esp Box"].Value then
+        local C = P or Flags["Esp Box Color"].Color
+        Box.Parent = RF; BoxInline.Color = C
+        if Flags["Esp Box Fill"].Value then
+            BoxFill.Parent = Box
+            BoxFillGradient.Parent = BoxFill
+            local FC = Flags["Esp Box Fill Color"].Color
+            local FT = Flags["Esp Box Fill Transparency"].Value
+            BoxFillGradient.Color = ColorSequence.new(FC, FC)
+            BoxFillGradient.Rotation = 90
+            BoxFillGradient.Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 1, 0),
+                NumberSequenceKeypoint.new(0.45, 1, 0),
+                NumberSequenceKeypoint.new(1, FT, 0),
+            })
+            BoxFillGradient.Enabled = true
+            BoxFill.Visible = true
+        else
+            BoxFill.Visible=false; BoxFill.Parent=nil; BoxFillGradient.Parent=nil
+        end
+        BoxOutline.Thickness = Flags["Esp Box Thickness"].Value
+        Box.Visible=true; BoxInline.Parent=Box; BoxOutline.Parent=RF
+    else
+        Box.Visible=false; Box.Parent=nil; BoxInline.Parent=nil; BoxOutline.Parent=nil
+        BoxFillGradient.Parent=nil
+    end
+
+    if Flags["Esp Health Bar"].Value then
+        local Hp=math.ceil(This.Health); local Percent=Hp/This.MaxHealth
+        local SizeY=ESP.Lerp(HI.Size.Y.Scale,Percent,0.1)
+        HO.Parent=RF; HI.Parent=HO
+        HI.Size=UDim2.new(0,1.5,SizeY,0); HI.Position=UDim2.new(0,0,1-SizeY,0)
+        HO.Size=UDim2.new(0,1.5,1,4); HO.Position=UDim2.new(0,-6,0,-2)
+        HI.BackgroundTransparency=0; HO.BackgroundTransparency=0
+        if P then
+            HG.Enabled=false; HG.Parent=nil; HI.BackgroundColor3=P
+        else
+            local C1=Flags["Esp Health Color 1"].Color
+            local C2=Flags["Esp Health Color 2"].Color
+            local T=Flags["Esp Health Bar Type"].Value
+            if T=="Static" then
+                HG.Enabled=false; HG.Parent=nil; HI.BackgroundColor3=C1
+            elseif T=="Dynamic" then
+                HG.Enabled=false; HG.Parent=nil
+                HI.BackgroundColor3=(C1==C2) and C1 or ESP.LerpColor(C2,C1,Percent)
+            else
+                HG.Parent=HI; HG.Enabled=true; HI.BackgroundColor3=Theme.White
+                HG.Color = ColorSequence.new({
+                    ColorSequenceKeypoint.new(0, C1),
+                    ColorSequenceKeypoint.new(1, C2),
+                })
+            end
+        end
+        if Percent<1 then
+            HT.Parent=HI; HT.Text=Hp
+            HT.TextColor3=Color3.fromRGB(255,255,255)
+            HT.TextTransparency=0
+            HT.Visible=true
+        else HT.Visible=false; HT.Parent=nil end
+        HI.Visible=true; HO.Visible=true
+    else
+        HI.Visible=false; HO.Visible=false; HI.Parent=nil; HO.Parent=nil; HT.Parent=nil; HG.Parent=nil
+    end
+
+    if Flags["Esp Name"].Value then
+        local F=Flags["Esp Name Font"].Value
+        local T=(F=="Small") and string.upper(This.Name) or This.Name
+        local NC=Flags["Esp Name Color"]
+        local nameScale = ComputeNameScale(This)
+
+        if F=="Bold" then
+            ON.Visible=false; ON.Parent=nil
+            SN.Parent=RF; SN.Position=UDim2.new(0.5,0,0,-9); SN.Text=T
+            SN.TextColor3=P or NC.Color; SN.TextTransparency=P and 0 or NC.Transparency
+            SN.TextSize = math.floor(9 * nameScale)
+            SN.Visible=true
+        else
+            local FF=(F=="Regular") and ESP.Fonts["Sevasto"] or ESP.Fonts["Tiny5"]
+            SN.Visible=false; SN.Parent=nil
+            ON.Parent=RF
+            pcall(function() ApplyFont(ON, FF) end)
+            ON.TextSize = math.floor((FF.Size or 9) * nameScale)
+            ON.Position=UDim2.new(0.5,0,0,(F=="Small") and -8 or -9)
+            ON.Text=T
+            ON.TextColor3=P or NC.Color; ON.TextTransparency=P and 0 or NC.Transparency
+            ON.Visible=true
+        end
+    else SN.Visible=false; SN.Parent=nil; ON.Visible=false; ON.Parent=nil end
+
+    do
+        local OY=7
+        if Flags["Esp Weapon"].Value and This.Weapon then
+            local WC=Flags["Esp Weapon Color"]
+            W.Parent=RF; W.Text=string.upper(This.Weapon.Name)
+            W.TextColor3=P or WC.Color; W.TextTransparency=P and 0 or WC.Transparency
+            W.Position=UDim2.new(0.5,0,1,OY); W.Visible=true; OY=OY+8
+        else W.Visible=false; W.Parent=nil end
+
+        if Flags["Esp Distance"].Value then
+            local DC=Flags["Esp Distance Color"]
+            D.Parent=RF; D.Text=math.ceil(This.Distance or 0).."M"
+            D.TextColor3=P or DC.Color; D.TextTransparency=P and 0 or DC.Transparency
+            D.Position=UDim2.new(0.5,0,1,OY); D.Visible=true; OY=OY+8
+        else D.Visible=false; D.Parent=nil end
+
+        if Flags["Esp Weapon Icon"].Value and This.Weapon then
+            local Icon=ItemIcons[This.Weapon.Name]
+            if Icon and Icon ~= "" then
+                WI.Parent=RF; WI.Image=Icon
+                WI.ImageTransparency=Flags["Esp Weapon Icon Color"].Transparency
+                WI.Position=UDim2.new(0.5,-13,1,OY-3); WI.Visible=true
+            else WI.Visible=false; WI.Parent=nil end
+        else WI.Visible=false; WI.Parent=nil end
+    end
+
+    do
+        local OY=0
+        local EspFlags=ESP.Flags
+        local Enabled=Flags["Esp Flags"].Value
+        local FC=Flags["Esp Flags Color"]
+        for i=1,#EspFlags do
+            local Cache=EspFlags[i]; local Index=Cache[1]
+            local Data=R.Flags[Index]
+            if not Data then
+                Data=ESP.DeepCopy(Cache[2]); R.Flags[Index]=Data
+            end
+            local Render=Data.Render
+            if not Render then
+                Render=ESP.Render("TextLabel",{
+                    ZIndex=3, Text="", TextXAlignment="Left",
+                    Visible=false, Position=UDim2.new(1,5,0,0),
+                    TextTransparency=0, TextStrokeTransparency=0,
+                    BackgroundTransparency=1,
+                })
+                Data.Render=Render
+            end
+            local FakeThis={
+                Character=This.Character, Humanoid=This.Humanoid,
+                RootPart=This.RootPart, SafeZone=This.SafeZone, Staff=This.Staff,
+            }
+            if Enabled and Data.GetVisibility(FakeThis) then
+                local Color=Data.GetColor(FakeThis)
+                Render.Parent=RF
+                Render.Position=UDim2.new(1,5,0,OY)
+                Render.Text=Data.GetText(FakeThis)
+                Render.TextColor3=Color.Color
+                Render.TextTransparency=Color.Transparency or FC.Transparency
+                Render.Visible=true; OY=OY+8
+            else
+                Render.Visible=false; Render.Parent=nil
+            end
+        end
+    end
+
+    for i=1,#SkeletonJoints do
+        local L=SK[i]
+        if not Flags["Esp Skeleton"].Value then
+            L.Visible=false
+        else
+            local A,B=SkeletonJoints[i][1],SkeletonJoints[i][2]
+            local PA,PB=This.BodyParts[A],This.BodyParts[B]
+            if not PA or not PB then
+                L.Visible=false
+            else
+                local F,OnF=ESP.WorldToViewportPoint(PA.Position+(A=="UpperTorso" and Vector3.new(0,0.4,0) or Vector3.zero))
+                local T2,OnT=ESP.WorldToViewportPoint(PB.Position+(B=="UpperTorso" and Vector3.new(0,0.4,0) or Vector3.zero))
+                if not OnF and not OnT then
+                    L.Visible=false
+                else
+                    L.Parent = ESP.Overlay
+                    L.ZIndex = 3
+                    local SC=Flags["Esp Skeleton Color"]
+                    UpdateLine(L, Vector2.new(F.X,F.Y), Vector2.new(T2.X,T2.Y), P or SC.Color, 1-(P and 0 or SC.Transparency))
+                end
+            end
+        end
+    end
+end
+
+function ESP.RenderPlayerOffScreen(This, R, SK, Position)
+    R.RenderFrame.Visible=false
+    for i=1,#SK do SK[i].Visible=false; SK[i].Parent=nil end
+    ESP.Parent(R)
+
+    local ArrowHolder = R.OOVHolder
+    local ArrowLeft   = R.OOVLeft
+    local ArrowRight  = R.OOVRight
+    local ArrowMiddle = R.OOVMiddle
+    local SN,ON = R.ShadowName,R.OutlineName
+    local W = R.Weapon
+    local HI,HO = R.Health,R.HealthBack
+    local D = R.Distance
+
+    if Flags["Esp Oov"].Value then
+        local Flag = Flags["Esp Oov Color"]
+        local Blink = Flags["Esp Oov Blink"].Value
+        local BS = Flags["Esp Oov Blink Speed"].Value
+        local T = Blink and (math.sin(tick()*(4+BS))+1)/2 or Flag.Transparency
+        local P = GetPriorityColor(This)
+        if not Blink and P then T = 0 end
+
+        local Rel = ESP.Camera.CFrame:PointToObjectSpace(Position)
+        local Ang = math.atan2(-Rel.Y, Rel.X)
+        local Dir = Vector2.new(math.cos(Ang), math.sin(Ang))
+
+        local Radius = Flags["Esp Oov Dynamic Distance"].Value
+            and math.clamp(10+(math.max(0,This.Distance)/150)*85,10,95)/400
+            or Flags["Esp Oov Distance"].Value/400
+        local Size = Flags["Esp Oov Dynamic Size"].Value
+            and (40-math.clamp(10+(math.max(0,This.Distance)/150)*20,10,30))
+            or Flags["Esp Oov Size"].Value
+
+        local PA = (Dir*ESP.ScreenSize.X*Radius) + (ESP.ScreenSize/2)
+
+        ArrowHolder.Parent = ESP.Overlay
+        ArrowHolder.Visible = true
+
+        local PA2, PB2, PC2
+        if Flags["Esp Oov Style"].Value == "Concave" then
+            PA2 = PA
+            PB2 = PA - ESP.Rotate(Dir, 0.45)*Size
+            PC2 = PA - ESP.Rotate(Dir, -0.45)*Size
+            local PD = PA - ESP.Rotate(Dir, 0)*(Size/1.6)
+            ArrowMiddle.Visible = true
+            UpdateLine(ArrowMiddle, PB2, PD, P or Flag.Color, 1-T)
+        else
+            PA2 = PA
+            PB2 = PA - ESP.Rotate(Dir, 0.5)*Size
+            PC2 = PA - ESP.Rotate(Dir, -0.5)*Size
+            ArrowMiddle.Visible = false
+        end
+
+        UpdateLine(ArrowLeft, PA2, PB2, P or Flag.Color, 1-T)
+        UpdateLine(ArrowRight, PA2, PC2, P or Flag.Color, 1-T)
+
+        local Elements = Flags["Esp Oov Elements"].Value
+        local CenterX = PA.X
+        local BottomY = PA.Y + Size
+        local OY = 6
+
+        if table.find(Elements, "Name") then
+            local F = Flags["Esp Name Font"].Value
+            local Txt = (F=="Small") and string.upper(This.Name) or This.Name
+            local NC = Flags["Esp Name Color"]
+            local nameScale = ComputeNameScale(This)
+            if F=="Bold" then
+                ON.Visible = false; ON.Parent = nil
+                SN.Parent = ESP.Overlay
+                SN.Position = UDim2.new(0, CenterX, 0, PA.Y - 12)
+                SN.Text = Txt
+                SN.TextColor3 = P or NC.Color
+                SN.TextTransparency = T
+                SN.TextSize = math.floor(9 * nameScale)
+                SN.Visible = true
+            else
+                local FF = (F=="Regular") and ESP.Fonts["Sevasto"] or ESP.Fonts["Tiny5"]
+                SN.Visible = false; SN.Parent = nil
+                ON.Parent = ESP.Overlay
+                pcall(function() ApplyFont(ON, FF) end)
+                ON.TextSize = math.floor((FF.Size or 9) * nameScale)
+                ON.Position = UDim2.new(0, CenterX, 0, PA.Y - ((F=="Small") and 14 or 12))
+                ON.Text = Txt
+                ON.TextColor3 = P or NC.Color
+                ON.TextTransparency = T
+                ON.Visible = true
+            end
+        end
+
+        if table.find(Elements, "Health Bar") then
+            local Hp = math.ceil(This.Health); local Percent = Hp/This.MaxHealth
+            local SizeY = ESP.Lerp(HI.Size.Y.Scale, Percent, 0.1)
+            HO.Parent = ESP.Overlay; HI.Parent = HO
+            HI.Position = UDim2.new(0, 0, 1-SizeY, 0)
+            HO.Position = UDim2.new(0, PA.X - 6, 0, PA.Y - 1)
+            HI.Size = UDim2.new(0, 1.5, SizeY, 0)
+            HO.Size = UDim2.new(0, 1.5, 0, Size)
+            HI.BackgroundTransparency = T
+            HO.BackgroundTransparency = T
+            if P then
+                R.HealthGradient.Enabled = false; HI.BackgroundColor3 = P
+            else
+                local C1 = Flags["Esp Health Color 1"].Color
+                local C2 = Flags["Esp Health Color 2"].Color
+                local HT2 = Flags["Esp Health Bar Type"].Value
+                if HT2=="Static" then
+                    R.HealthGradient.Enabled=false; R.HealthGradient.Parent=nil; HI.BackgroundColor3=C1
+                elseif HT2=="Dynamic" then
+                    R.HealthGradient.Enabled=false; R.HealthGradient.Parent=nil
+                    HI.BackgroundColor3 = (C1==C2) and C1 or ESP.LerpColor(C2,C1,Percent)
+                else
+                    R.HealthGradient.Parent=HI; R.HealthGradient.Enabled=true
+                    HI.BackgroundColor3=Theme.White
+                    R.HealthGradient.Color = ColorSequence.new({
+                        ColorSequenceKeypoint.new(0, C1),
+                        ColorSequenceKeypoint.new(1, C2),
+                    })
+                end
+            end
+            if Percent < 1 then
+                R.HealthText.Parent = HI; R.HealthText.Text = Hp
+                R.HealthText.TextColor3 = Color3.fromRGB(255,255,255)
+                R.HealthText.TextTransparency = T
+                R.HealthText.Visible = true
+            else
+                R.HealthText.Visible = false
+            end
+            HI.Visible = true; HO.Visible = true
+        end
+
+        if table.find(Elements, "Weapon") and This.Weapon then
+            local WC = Flags["Esp Weapon Color"]
+            W.Parent = ESP.Overlay
+            W.Position = UDim2.new(0, CenterX, 0, BottomY + OY)
+            W.Text = string.upper(This.Weapon.Name)
+            W.TextColor3 = P or WC.Color
+            W.TextTransparency = T
+            W.Visible = true
+            OY = OY + 8
+        end
+
+        if table.find(Elements, "Distance") then
+            local DC = Flags["Esp Distance Color"]
+            D.Parent = ESP.Overlay
+            D.Position = UDim2.new(0, CenterX, 0, BottomY + OY)
+            D.Text = math.ceil(This.Distance or 0).."M"
+            D.TextColor3 = P or DC.Color
+            D.TextTransparency = T
+            D.Visible = true
+        end
+    else
+        ArrowHolder.Visible = false
+        SN.Visible = false; ON.Visible = false
+        W.Visible = false; HI.Visible = false; HO.Visible = false; D.Visible = false
+    end
+end
+
+function ESP.RenderChams(This)
+    if not This.Renders then return end
+    local Chams=This.Renders.Chams
+    local BodyParts,Alive=This.BodyParts,This.Alive
+    local Enabled=Flags["Chams Enabled"].Value
+    local Glow=Flags["Glows Enabled"].Value
+    local GlowSize=Flags["Glows Size"].Value
+    local CC=Flags["Chams Color"]; local OC=Flags["Outline Color"]
+    for i=1,#Chams do
+        local D=Chams[i]; local Render,Name,IsOutline=D[1],D[2],D[3]
+        local Part=BodyParts[Name]
+        if not Part or not Alive then Render.Visible=false; Render.Adornee=nil; continue end
+        Render.Adornee=Part; Render.Visible=Enabled
+        if IsOutline then
+            Render.Color3=OC.Color
+            Render.Transparency=Glow and (OC.Transparency/GlowSize) or OC.Transparency
+            Render.AlwaysOnTop=Alive and Glow
+        else
+            Render.Color3=CC.Color
+            Render.Transparency=CC.Transparency
+        end
+    end
+end
+
+function ESP.RenderAllChams(InfoPlayers)
+    for i=1,#InfoPlayers do ESP.RenderChams(InfoPlayers[i]) end
+end
+
+local Info = {}
+Info.Players = {}
+Info.LocalPlayer = {}
+
+function Info.Add(plr)
+    local IsLocal=(plr==LocalPlayer)
+    local This={
+        Player=plr, Name=plr.Name, IsLocalPlayer=IsLocal,
+        Health=115, MaxHealth=115, Distance=0,
+        Alive=false, Teammate=false, SafeZone=false,
+        WeaponType="None", Weapon=nil,
+        Whitelist=false, Priority=false, DisableEsp=false,
+        LastRefresh=0, Cardinal=1,
+        BodyParts={}, Inventory={},
+        Friends="false", Staff="false",
+        _SmoothX=nil, _SmoothY=nil, _SmoothW=nil, _SmoothH=nil,
+        _SmoothNameScale=nil,
+    }
+
+    -- [改造] 自己同样建立渲染对象，是否显示交给 ESP.TrackSelf 决定
+    if IsLocal then Info.LocalPlayer=This end
+    This.Renders=ESP.GetPlayerRenders(plr)
+    Info.Players[#Info.Players+1]=This
+
+    local function bindChar(char)
+        -- [改造] 宿主可注入 CharResolver，兼容非标准角色
+        local hum, root, d = nil, nil, nil
+        if ESP.CharResolver then
+            d = ESP.CharResolver(char)
+            if d then
+                hum, root = d.humanoid, d.root
+                This.Health    = d.health or 0
+                This.MaxHealth = d.maxHealth or 100
+                This.Alive     = (d.alive ~= false)
+            end
+        else
+            hum  = char:WaitForChild("Humanoid",10)
+            root = char:WaitForChild("HumanoidRootPart",10)
+            if hum then
+                This.Health=hum.Health; This.MaxHealth=hum.MaxHealth; This.Alive=true
+            end
+        end
+        if not root then return end
+        This.Character=char; This.Humanoid=hum; This.RootPart=root
+        table.clear(This.BodyParts); This.Weapon=nil
+        -- [改造] 宿主可指定"取包围盒用的身体"：游戏把真角色整体隐藏、
+        -- 另建一具可见 rig 时，CharResolver 返回 { body = 那具 rig } 即可。
+        local _partsSrc = (d and d.body) or char
+        for _,Part in next, _partsSrc:GetChildren() do
+            if Part:IsA("BasePart") and table.find(BodyPartNames,Part.Name) then
+                This.BodyParts[Part.Name]=Part
+            elseif Part:IsA("Tool") or (Part:IsA("Model") and Part:FindFirstChildOfClass("Tool")) then
+                This.Weapon=Part
+            end
+        end
+        _partsSrc.ChildAdded:Connect(function(Part)
+            if Part:IsA("BasePart") and table.find(BodyPartNames,Part.Name) then
+                This.BodyParts[Part.Name]=Part
+            elseif Part:IsA("Tool") or (Part:IsA("Model") and Part:FindFirstChildOfClass("Tool")) then
+                This.Weapon=Part
+            end
+        end)
+        _partsSrc.ChildRemoved:Connect(function(Part)
+            if Part:IsA("BasePart") and This.BodyParts[Part.Name] then
+                This.BodyParts[Part.Name]=nil
+            elseif This.Weapon==Part then
+                This.Weapon=nil
+            end
+        end)
+        if hum then
+            hum.HealthChanged:Connect(function(h)
+                This.Health=h; This.MaxHealth=hum.MaxHealth
+                if h<=0 then This.Alive=false end
+            end)
+        end
+    end
+
+    if plr.Character then bindChar(plr.Character) end
+    plr.CharacterAdded:Connect(bindChar)
+    plr.CharacterRemoving:Connect(function()
+        This.Alive=false; This.Health=0; This.Character=nil
+        This.Humanoid=nil; This.RootPart=nil; table.clear(This.BodyParts)
+        This._SmoothX=nil; This._SmoothY=nil; This._SmoothW=nil; This._SmoothH=nil
+        This._SmoothNameScale=nil
+    end)
+
+    if not IsLocal then
+        task.spawn(function()
+            pcall(function()
+                This.Friends=plr:IsFriendsWith(LocalPlayer.UserId) and "true" or "false"
+            end)
+        end)
+    end
+end
+
+function Info.Remove(plr)
+    if plr==LocalPlayer then return end
+    for i,This in next, Info.Players do
+        if This.Player==plr then
+            local R=This.Renders
+            for k,v in next, R do
+                if k=="Skeleton" then
+                    for _,l in next, v do if typeof(l)=="Instance" then l:Destroy() end end
+                elseif k=="Chams" then
+                    for _,c in next, v do c[1]:Destroy() end
+                elseif k=="Flags" then
+                    for _,f in next, v do if f.Render then f.Render:Destroy() end end
+                elseif k=="CornerH" or k=="CornerV" then
+                    for _,c in next, v do if typeof(c)=="Instance" then c:Destroy() end end
+                elseif k=="OOVLeft" or k=="OOVRight" or k=="OOVMiddle" then
+                    if typeof(v)=="Instance" then v:Destroy() end
+                elseif typeof(v)=="Instance" then
+                    v:Destroy()
+                end
+            end
+            table.remove(Info.Players,i); return
+        end
+    end
+end
+
+
+-- [已移除] Track：原库用于追踪世界物体（Nodes/Plants/...），本项目不需要
+local function _RemovedTrack(container, Type, buildRenders, nameFn, typeFn, rootFn)
+    local list={}
+    local function add(child)
+        if not child:IsA("Model") then return end
+        local This={
+            _Type=Type,
+            Name=nameFn and nameFn(child) or child.Name,
+            Type=typeFn and typeFn(child) or nil,
+            Character=child,
+            RootPart=rootFn and rootFn(child) or child.PrimaryPart,
+            Renders=buildRenders(),
+            Health=child:GetAttribute("Health") or 0,
+            Distance=0, LastRefresh=0, Cardinal=1,
+        }
+        This.Renders._Color=Flags["Esp "..Type.." Color"].Color
+        This.Renders._ColorT=Flags["Esp "..Type.." Color"].Transparency
+        This.Renders._Distance=Flags["Esp "..Type.." Distance"].Value
+        This.Renders._DistanceColor=Flags["Esp "..Type.." Distance Color"].Color
+        list[#list+1]=This
+    end
+    for _,c in next, container:GetChildren() do add(c) end
+    container.ChildAdded:Connect(add)
+    container.ChildRemoved:Connect(function(c)
+        for i=#list,1,-1 do
+            if list[i].Character==c then
+                for _,r in next, list[i].Renders do
+                    if typeof(r)=="Instance" then r:Destroy() end
+                end
+                table.remove(list,i)
+            end
+        end
+    end)
+    return list
+end
+
+
+function ESP.Step()
+    local RI={}
+    local now=os.clock()
+    local camPos = ESP.Camera.CFrame.Position
+
+    for i=1,#Info.Players do
+        local This=Info.Players[i]; local R=This.Renders
+        -- [改造] 每帧从宿主解析器刷新血量 / 存活（Attribute 变化不触发 Humanoid.HealthChanged）
+        if ESP.CharResolver and This.Character then
+            local d = ESP.CharResolver(This.Character)
+            if d then
+                This.Health    = d.health or This.Health
+                This.MaxHealth = d.maxHealth or This.MaxHealth
+                This.Alive     = (d.alive ~= false)
+                if d.root then This.RootPart = d.root end
+            end
+        end
+        local Hide = (not ESP.Enabled)
+            or (not This.RootPart) or This.DisableEsp
+            or ((not This.Alive) and (not ESP.ShowDead))
+            or (This.IsLocalPlayer and (not ESP.TrackSelf))
+            or ((camPos - This.RootPart.Position).Magnitude > Flags["Esp Max Distance"].Value)
+            or (ESP.TeamCheck and ESP.TeamResolver and ESP.TeamResolver(This.Player))
+        if Hide then
+            R.RenderFrame.Visible=false
+            R.OOVHolder.Visible=false
+            for k=1,#R.Skeleton do R.Skeleton[k].Visible=false; R.Skeleton[k].Parent=nil end
+            ESP.Parent(R)
+        else
+            This.Distance = (camPos - This.RootPart.Position).Magnitude
+            -- [改造] 宿主按玩家注入颜色（敌我分色）
+            This.OverrideColor = ESP.ColorResolver and ESP.ColorResolver(This.Player) or nil
+            if ESP.NameResolver then This.Name = ESP.NameResolver(This.Player) or This.Name end
+            if ESP.WeaponResolver then This.Weapon = ESP.WeaponResolver(This.Player) end
+            local BoundingType=Flags["Esp Bounding Type"].Value
+            local BP,BS=ESP.GetBoundingBox(This,This.RootPart.Position,BoundingType)
+            if BP then RI[#RI+1]={"Player",This,R,BP,BS}
+            else ESP.RenderPlayerOffScreen(This,R,R.Skeleton,This.RootPart.Position) end
+        end
+    end
+
+
+
+    for i=1,#RI do
+        local R=RI[i]
+        if typeof(R[3].RenderFrame)=="Instance" then
+            R[3].RenderFrame.ZIndex=math.floor(100000-(R[2].Distance or 0))
+        end
+        if R[1]=="Player" then ESP.RenderPlayerOnScreen(R[2],R[3],R[4],R[5]) end
+    end
+end
+
+function ESP.RegisterFlag(Name, Data)
+    ESP.Flags[#ESP.Flags+1]={Name,Data}
+end
+
+function ESP.DeRegisterFlag(Name)
+    for i=#ESP.Flags,1,-1 do
+        if ESP.Flags[i][1]==Name then table.remove(ESP.Flags,i) end
+    end
+    for _,This in next, Info.Players do
+        if This.Renders and This.Renders.Flags[Name] then
+            local f=This.Renders.Flags[Name]
+            if f.Render then f.Render:Destroy() end
+            This.Renders.Flags[Name]=nil
+        end
+    end
+end
+
+
+-- [改造] 相机同步：游戏脚本可能替换 / 接管 CurrentCamera，
+-- 必须动态跟随，否则 ESP 会一直持有旧相机引用导致投影错位。
+local function SyncCamera()
+    local c = Workspace.CurrentCamera
+    if c then
+        ESP.Camera = c
+        ESP.ScreenSize = c.ViewportSize
+    end
+end
+Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(SyncCamera)
+
+-- [改造] 不再自动 Init，由宿主脚本决定何时启动
+function ESP.Init()
+    SyncCamera()
+    if ESP.Overlay then return ESP end
+    ESP.Overlay=Instance.new("ScreenGui")
+    ESP.Overlay.Name="ESP_Overlay"
+    ESP.Overlay.ResetOnSpawn=false
+    ESP.Overlay.IgnoreGuiInset=true
+    ESP.Overlay.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+    ESP.Overlay.Parent=PlayerGui
+
+    for _,plr in next, Players:GetPlayers() do Info.Add(plr) end
+    Players.PlayerAdded:Connect(Info.Add)
+    Players.PlayerRemoving:Connect(Info.Remove)
+
+    RunService.RenderStepped:Connect(function()
+        SyncCamera()
+        ESP.Step()
+    end)
+    return ESP
+end
+
+-- 宿主设置：同步一批 Flag 值
+function ESP.SetFlags(t)
+    for k, v in next, t do
+        if Flags[k] then
+            if type(v) == "table" then
+                for kk, vv in next, v do Flags[k][kk] = vv end
+            else
+                Flags[k].Value = v
+            end
+        end
+    end
+end
+
+return ESP
+end)()
+-- ===================== 绘制库结束 =====================
+
+-- ===================== CX 适配层（注入解析器）=====================
+--  ⚠️ 解析器必须宽容：任一项拿不到就返回 nil，绘制库会直接跳过该玩家（静默隐藏）
+if ESP then
+	ESP.LocalPlayer = LocalPlayer
+	ESP.Camera = workspace.CurrentCamera
+	ESP.TrackSelf = false
+	ESP.ShowDead = false
+	ESP.TeamCheck = false
+
+	local function resolveRoot(char)
+		local r = char.PrimaryPart
+		if r and r:IsA("BasePart") then return r end
+		for _, n in ipairs({ "HumanoidRootPart", "RootPart", "UpperTorso", "Torso", "Head" }) do
+			local c = char:FindFirstChild(n)
+			if c and c:IsA("BasePart") then return c end
+		end
+		return nil
+	end
+
+	ESP.CharResolver = function(char)
+		if not char then return nil end
+		local hum = char:FindFirstChildOfClass("Humanoid") or char:FindFirstChild("Humanoid")
+		local root = resolveRoot(char)
+		if not root then return nil end
+		local hp, mhp, alive = 100, 100, true
+		if hum then
+			hp = hum.Health
+			mhp = hum.MaxHealth
+			alive = (hp > 0) and (hum:GetAttribute("Dead") ~= true)
+		else
+			alive = root:IsDescendantOf(game:GetService("Workspace"))
+		end
+		return { humanoid = hum, root = root, health = hp, maxHealth = mhp, alive = alive, body = char }
+	end
+
+	ESP.TeamResolver = function(player)
+		local t1, t2 = player.Team, LocalPlayer.Team
+		if t1 == nil or t2 == nil then return false end
+		return t1 == t2
+	end
+
+	ESP.NameResolver = function(player)
+		return player.DisplayName or player.Name
+	end
+
+	ESP.WeaponResolver = nil
+
+	-- ⭐ 外观复位：保证默认就是"绘制库原版"（紫色完整方框 + 紫色填充）
+	task.spawn(function()
+		task.wait(2.5)
+		pcall(function()
+			ESP.SetFlags({
+				["Esp Box Style"]      = "Full",
+				["Esp Box Color"]      = { Color = ESP.Theme.PurpleLight },
+				["Esp Box Fill Color"] = { Color = ESP.Theme.PurpleMid },
+			})
+		end)
+	end)
+end
+-- ===================== CX 适配层结束 =====================
+
 -- ==================================================================
 --  WindUI 适配层
 --  参考脚本（final.lua）用的是它自带的 EclipseUI；这里保持同一套调用形状，
@@ -1320,6 +3157,18 @@ local _WINDOW = WindUI:CreateWindow({
 	Author = "CX",
 	Folder = "CX",
 	Size = UDim2.fromOffset(620, 480),
+	-- ⭐ 背景图三件套（WindUI 机制：缺一不可）
+	--   Background 必须是 rbxassetid://数字 或 https:// 或 video: 开头，否则走兜底分支 → 全透明
+	Background = (function()
+		local POOL = {
+			-- ⚠️ 在这里填你自己的背景图资源 ID（数字）
+		}
+		if #POOL > 0 then
+			return "rbxassetid://" .. tostring(POOL[math.random(1, #POOL)])
+		end
+		return nil
+	end)(),
+	BackgroundImageTransparency = 0,
 	Transparent = false,
 	Theme = "Dark",
 	User = { Enabled = true, Anonymous = true },
@@ -1377,13 +3226,26 @@ end
 
 local function wrapTab(wtab)
 	local t = {}
+	-- ⭐ 页签上直接放控件：自动建一个隐含分区，把控件都挂进去
+	local implicit
+	local function sec()
+		if not implicit then
+			implicit = wrapSection(wtab:Section({ Title = "设置", Opened = true }))
+		end
+		return implicit
+	end
 	function t:Section(name)
 		local title = name
 		if type(name) == "table" then title = name.Name or name.Title end
 		return wrapSection(wtab:Section({ Title = title, Opened = true }))
 	end
-	function t:Toggle(o) return wrapSection(wtab):Toggle(o) end
-	function t:Button(o) return wrapSection(wtab):Button(o) end
+	function t:Toggle(o)   return sec():Toggle(o) end
+	function t:Slider(o)   return sec():Slider(o) end
+	function t:Input(o)    return sec():Input(o) end
+	function t:Button(o)   return sec():Button(o) end
+	function t:Dropdown(o) return sec():Dropdown(o) end
+	function t:Paragraph(o)return sec():Paragraph(o) end
+	function t:Colorpicker(o) return sec():Colorpicker(o) end
 	return t
 end
 
@@ -1599,32 +3461,75 @@ playWelcome(function()
         Size = UDim2.new(0, adaptive.windowWidth, 0, adaptive.windowHeight), BackgroundTransparency = 0
     }):Play()
 
-    local tabCombat = Window:Tab({Name = "战斗"})
-    local s1 = tabCombat:Section("Ragebot")
-    s1:Toggle({Name = "Ragebot", Default = false, Callback = function(s) CFG.ragebot = s end})
-    s1:Toggle({Name = "自动换弹", Default = true, Callback = function(s) CFG.autoReload = s end})
-    s1:Toggle({Name = "弹道显示", Default = false, Callback = function(s) CFG.bulletTrace = s end})
-    local s2 = tabCombat:Section("Aimbot")
+    -- [改造] 空壳父页签「战斗」已删（功能拆成独立页签）
+    -- ===================== RageBot（CX_RAGE · 真实击杀协议）=====================
+    local s1 = Window:Tab({ Name = "RageBot", Icon = "crosshair" })
+    s1:Toggle({ Name = "RageBot（打范围内所有人）", Default = false,
+        Callback = function(on) CX_RAGE.Set(on) end })
+    s1:Slider({ Name = "作用范围", Default = 300, Min = 20, Max = 2000,
+        Callback = function(v) CX_RAGE.Range = v end })
+    s1:Slider({ Name = "每轮间隔（×0.01 秒）", Default = 10, Min = 3, Max = 100,
+        Callback = function(v) CX_RAGE.Interval = math.max(0.03, v / 100) end })
+    s1:Slider({ Name = "一轮最多打几个", Default = 8, Min = 1, Max = 20,
+        Callback = function(v) CX_RAGE.MaxTargets = v end })
+    s1:Dropdown({ Name = "瞄准部位", Default = "Head", Values = { "Head", "HumanoidRootPart", "UpperTorso", "Torso" },
+        Callback = function(v) CX_RAGE.Part = v end })
+    s1:Toggle({ Name = "不打同队", Default = false,
+        Callback = function(v) CX_RAGE.TeamCheck = v end })
+    s1:Toggle({ Name = "只打战斗模式的人", Default = false,
+        Callback = function(v) CX_RAGE.OnlyCombat = v end })
+    s1:Toggle({ Name = "弹道绘制", Default = true,
+        Callback = function(v) CX_RAGE.Tracer = v end })
+    s1:Button({ Name = "自检：RageBot 状态", Callback = function()
+        w(CX_RAGE.Status())
+    end })
+
+    local s2 = Window:Tab({ Name = "Aimbot" })
     s2:Toggle({Name = "自瞄", Default = false, Callback = function(s) CFG.aimbot = s end})
     s2:Toggle({Name = "FOV圈", Default = true, Callback = function(s) CFG.showAimCircle = s end})
     s2:Toggle({Name = "标名", Default = true, Callback = function(s) CFG.showTargetName = s end})
     s2:Slider({Name = "FOV", Default = 150, Min = 10, Max = 500, Callback = function(v) CFG.aimbotFOV = v end})
 
-    local tabVisual = Window:Tab({Name = "视觉"})
-    local s3 = tabVisual:Section("ESP")
-    s3:Toggle({Name = "ESP", Default = false, Callback = function(s) CFG.esp = s end})
-    s3:Toggle({Name = "血量", Default = true, Callback = function(s) CFG.showHealth = s end})
-    s3:Toggle({Name = "阵营", Default = true, Callback = function(s) CFG.showTeam = s end})
-    s3:Toggle({Name = "PVP标记", Default = true, Callback = function(s) CFG.showPVP = s end})
+    -- [改造] 空壳父页签「视觉」已删（功能拆成独立页签）
+    -- ===================== ESP（通用绘制库）=====================
+    --  ⭐ 样式就是绘制库原版：完整方框 PurpleLight(210,180,255) + 框内 PurpleMid(170,120,255) 填充
+    local s3 = Window:Tab({ Name = "ESP", Icon = "eye" })
+    s3:Toggle({ Name = "启用 ESP", Default = false,
+        Callback = function(on) if ESP then ESP.Enabled = on end end })
+    s3:Toggle({ Name = "血量条", Default = true,
+        Callback = function(on) if ESP then ESP.SetFlags({ ["Esp Health Bar"] = { Value = on } }) end end })
+    s3:Toggle({ Name = "名字", Default = true,
+        Callback = function(on) if ESP then ESP.SetFlags({ ["Esp Name"] = { Value = on } }) end end })
+    s3:Toggle({ Name = "距离", Default = true,
+        Callback = function(on) if ESP then ESP.SetFlags({ ["Esp Distance"] = { Value = on } }) end end })
+    s3:Toggle({ Name = "骨架", Default = true,
+        Callback = function(on) if ESP then ESP.SetFlags({ ["Esp Skeleton"] = { Value = on } }) end end })
+    s3:Toggle({ Name = "武器", Default = true,
+        Callback = function(on) if ESP then ESP.SetFlags({ ["Esp Weapon"] = { Value = on } }) end end })
+    s3:Toggle({ Name = "框内填充", Default = true,
+        Callback = function(on) if ESP then ESP.SetFlags({ ["Esp Box Fill"] = { Value = on } }) end end })
+    s3:Toggle({ Name = "队友过滤", Default = false,
+        Callback = function(on) if ESP then ESP.TeamCheck = on end end })
+    s3:Slider({ Name = "ESP 最大距离", Default = 3000, Min = 100, Max = 99999,
+        Callback = function(v) if ESP then ESP.SetFlags({ ["Esp Max Distance"] = { Value = v } }) end end })
+    s3:Button({ Name = "复位成原版外观（紫框+紫填充）", Callback = function()
+        if ESP then
+            ESP.SetFlags({
+                ["Esp Box Style"]      = "Full",
+                ["Esp Box Color"]      = { Color = ESP.Theme.PurpleLight },
+                ["Esp Box Fill Color"] = { Color = ESP.Theme.PurpleMid },
+            })
+            w("ESP 外观已复位")
+        end
+    end })
 
-    local tabSettings = Window:Tab({Name = "设置"})
-    local s4 = tabSettings:Section("目标")
+    local s4 = Window:Tab({ Name = "目标" })
     s4:Input({Name = "部位", Default = "Head", Placeholder = "Head/Torso", Callback = function(v) CFG.targetPart = v end})
 
     -- [改造] 「心跳伪造」已移除（原实现改 game 元表，CX 里本来也没生效）
 
     -- ===================== 远程交互（propInteraction）=====================
-    local s8 = tabSettings:Section("远程交互")
+    local s8 = Window:Tab({ Name = "远程交互" })
     s8:Slider({ Name = "道具扫描半径", Default = 80, Min = 5, Max = 500,
         Callback = function(v) CX_PROP_RADIUS = v end })
     s8:Dropdown({ Name = "交互动作", Default = "toggle",
@@ -1667,7 +3572,7 @@ playWelcome(function()
     end })
 
     -- ===================== 保险箱 / 容器破解（CX_CRACK）=====================
-    local s11 = tabSettings:Section("保险箱破解")
+    local s11 = Window:Tab({ Name = "保险箱破解" })
     s11:Slider({ Name = "破解扫描半径", Default = 60, Min = 10, Max = 1000,
         Callback = function(v) CX_CRACK.Radius = v end })
     s11:Button({ Name = "一键破解范围内所有容器", Callback = function()
@@ -1679,7 +3584,7 @@ playWelcome(function()
     end })
 
     -- ===================== 飞行（CX_FLY · 走平台通道）=====================
-    local s9 = tabSettings:Section("飞行")
+    local s9 = Window:Tab({ Name = "飞行" })
     s9:Toggle({ Name = "飞行", Default = false,
         Callback = function(on) CX_FLY.Set(on) end })
     s9:Toggle({ Name = "走平台通道（服务端认可）", Default = true,
@@ -1688,20 +3593,24 @@ playWelcome(function()
         Callback = function(v) CX_FLY.Up = v end })
     s9:Toggle({ Name = "下降（手机点这个）", Default = false,
         Callback = function(v) CX_FLY.Down = v end })
-    s9:Slider({ Name = "飞行速度", Default = 60, Min = 5, Max = 300,
+    s9:Toggle({ Name = "定身（悬浮不落地）", Default = true,
+        Callback = function(v) CX_FLY.Anchor = v end })
+    s9:Toggle({ Name = "被拉回自动降速", Default = true,
+        Callback = function(v) CX_FLY.Adaptive = v end })
+    s9:Slider({ Name = "飞行速度", Default = 30, Min = 5, Max = 300,
         Callback = function(v) CX_FLY.Speed = v end })
-    s9:Slider({ Name = "飞行升降速度", Default = 40, Min = 5, Max = 200,
+    s9:Slider({ Name = "飞行升降速度", Default = 22, Min = 5, Max = 200,
         Callback = function(v) CX_FLY.VertSpeed = v end })
     s9:Slider({ Name = "单帧位移上限", Default = 8, Min = 1, Max = 40,
         Callback = function(v) CX_FLY.MaxStep = v end })
     s9:Slider({ Name = "找平台范围", Default = 250, Min = 20, Max = 2000,
         Callback = function(v) CX_FLY.PlatformRange = v end })
-    s9:Button({ Name = "自检：飞行状态", Callback = function()
+    s9:Button({ Name = "★ 自检：飞行状态（看被拉回次数）", Callback = function()
         w(CX_FLY.Status())
     end })
 
     -- ===================== 状态伪造（CX_STATE）=====================
-    local s10 = tabSettings:Section("状态伪造")
+    local s10 = Window:Tab({ Name = "状态伪造" })
     s10:Toggle({ Name = "伪造玩家状态（钉住最快档）", Default = false,
         Callback = function(on) CX_STATE.Enabled = on end })
     s10:Toggle({ Name = "永远上报「冲刺中」", Default = false,
@@ -1710,7 +3619,49 @@ playWelcome(function()
         w(CX_STATE.Report())
     end })
 
-    local s7 = tabSettings:Section("关于")
+    -- ===================== 载具飞行（CX_VFLY · 不限速）=====================
+    local s12 = Window:Tab({ Name = "载具飞行", Icon = "plane" })
+    s12:Paragraph({ Name = "说明", Desc = "要先进载具（直升机/车）。载具物理是客户端权威的 ⇒ 不限速。" })
+    s12:Toggle({ Name = "载具飞行（不限速）", Default = false,
+        Callback = function(on) CX_VFLY.Set(on) end })
+    s12:Toggle({ Name = "去掉阻力（限速来源）", Default = true,
+        Callback = function(v) CX_VFLY.KillDrag = v end })
+    s12:Toggle({ Name = "保持水平", Default = true,
+        Callback = function(v) CX_VFLY.KeepUpright = v end })
+    s12:Toggle({ Name = "上升（手机点这个）", Default = false,
+        Callback = function(v) CX_VFLY.Up = v end })
+    s12:Toggle({ Name = "下降（手机点这个）", Default = false,
+        Callback = function(v) CX_VFLY.Down = v end })
+    s12:Slider({ Name = "推力", Default = 400000, Min = 10000, Max = 3000000,
+        Callback = function(v) CX_VFLY.Thrust = v end })
+    s12:Slider({ Name = "升力", Default = 250000, Min = 10000, Max = 3000000,
+        Callback = function(v) CX_VFLY.Lift = v end })
+    s12:Button({ Name = "自检：载具飞行状态", Callback = function()
+        w(CX_VFLY.Status())
+    end })
+
+    -- ===================== 枪械（CX_WPN）=====================
+    local s13 = Window:Tab({ Name = "枪械", Icon = "target" })
+    s13:Paragraph({ Name = "说明", Desc = "子弹弹道是客户端算的（Bullet 投射物自己 Raycast），所以射速/射程客户端可控；真正无限命中看 RageBot。" })
+    s13:Toggle({ Name = "无限子弹（本地补满 + 无限标记）", Default = false,
+        Callback = function(on) CX_WPN.Set(on) end })
+    s13:Toggle({ Name = "秒换弹", Default = true,
+        Callback = function(v) CX_WPN.InstantReload = v end })
+    s13:Slider({ Name = "补弹间隔（×0.01 秒）", Default = 10, Min = 2, Max = 100,
+        Callback = function(v) CX_WPN.TopUpRate = math.max(0.02, v / 100) end })
+    s13:Button({ Name = "立即补满当前武器", Callback = function()
+        local t = nil
+        pcall(function()
+            local Devv = require(game:GetService("ReplicatedStorage").Devv)
+            t = Devv.load("ClientTools").GetLocalEquippedTool()
+        end)
+        if t then CX_WPN.Fill(t) w("已补满") else w("手上没有武器") end
+    end })
+    s13:Button({ Name = "自检：枪械状态", Callback = function()
+        w(CX_WPN.Status())
+    end })
+
+    local s7 = Window:Tab({ Name = "关于" })
     s7:Button({Name = "Devv: " .. tostring(devvReady), Callback = function() end})
 end)
 
