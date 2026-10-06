@@ -4,6 +4,7 @@
 -- ==================================================================
 CX_META = CX_META or {}
 CX_META.Enabled = true
+CX_META.Silent = true          -- 静默：不弹任何通知
 CX_META.Dropped = 0
 CX_META.Blocked = {
 	fling = true, resetVelocity = true, spectatePlayer = true,
@@ -109,6 +110,219 @@ function CX_META.Install()
 end
 
 pcall(CX_META.Install)
+
+
+-- ==================================================================
+--  CX 状态伪造层（CX_STATE）
+--
+--  查 dump 结论：客户端**没有**位置/速度上报接口 —— 位置只走引擎复制，
+--  服务端直接读，客户端改不了（这也是"飞行被拉回"的根本原因）。
+--
+--  但客户端**有状态上报**：
+--      Network.FireServer("replicatePlayerProperty", <属性名>, <值>)
+--  来自 `ReplicatedStorage.Client.Wanted.Objects.ClientPlayer`：
+--      function value34.ReplicatePlayerProperty(p172, p173)
+--          if p172.player == LocalPlayer then
+--              value26.FireServer("replicatePlayerProperty", p173, p172.playerState[p173]);
+--          end
+--      end
+--  dump 里出现过的属性名：sprinting / ragdolled / equipped / arrested / cellphone …
+--  （还有 Sprint / Jump 这类设置项）
+--
+--  ⭐ 思路：服务端判"你该跑多快"很可能就是看这些状态（走路 / 冲刺 / 载具）。
+--     那就**永远上报最快的那一档** —— 把 sprinting 之类的字段钉成 true。
+--     这不改位置，只是让服务端"允许"的速度上限更高，从而**减少被拉回**。
+-- ==================================================================
+CX_STATE = CX_STATE or {}
+CX_STATE.Enabled = true          -- 静默默认开
+CX_STATE.ForceSprint = true      -- 永远上报"正在冲刺"
+CX_STATE.Log = {}                -- 见过哪些 playerState 属性名
+CX_STATE.Forged = 0
+CX_STATE._hooked = false
+
+-- 要把这些属性钉成什么值
+CX_STATE.Pin = {
+	sprinting = true,
+	walking = false,
+	isRunning = true,
+	ragdolled = false,
+	crouching = false,
+}
+
+function CX_STATE.Install()
+	if CX_STATE._hooked then return true end
+	local ok, net = pcall(function()
+		return require(game:GetService("ReplicatedStorage"):WaitForChild("Shared")
+			:WaitForChild("Core"):WaitForChild("Network"))
+	end)
+	if not ok or type(net) ~= "table" or type(net.FireServer) ~= "function" then
+		return false
+	end
+	local prev = net.FireServer
+	net.FireServer = function(name, key, value, ...)
+		if CX_STATE.Enabled and name == "replicatePlayerProperty" and type(key) == "string" then
+			CX_STATE.Log[key] = (CX_STATE.Log[key] or 0) + 1
+			local pin = CX_STATE.Pin[key]
+			if pin ~= nil then
+				CX_STATE.Forged = CX_STATE.Forged + 1
+				return prev(name, key, pin, ...)
+			end
+		end
+		return prev(name, key, value, ...)
+	end
+	CX_STATE._hooked = true
+	return true
+end
+
+function CX_STATE.Report()
+	local list = {}
+	for k, v in pairs(CX_STATE.Log) do list[#list + 1] = k .. "×" .. v end
+	table.sort(list)
+	return string.format("伪造 %d 次 | 见过的状态属性: %s",
+		CX_STATE.Forged, #list > 0 and table.concat(list, " ") or "（还没有）")
+end
+
+pcall(CX_STATE.Install)
+
+
+-- ==================================================================
+--  容器/保险箱破解（CX_CRACK）
+--
+--  ⭐ 挖到底的结论：**密码校验完全在客户端**。
+--  `ClientGizmo.Gizmos.WorldSafe.Interact()`：
+--      value:StartKeypadSequence({
+--          position = value11.position,
+--          numKeys  = value11.properties.numKeys or -1,
+--          successFunc = function()                                  -- ← 客户端自己判密码对不对
+--              value6.FireServer("gizmoInteraction", value11.objectId, "OpenSafe")
+--          end
+--      })
+--  ⇒ 服务端收到的只有 `("gizmoInteraction", objectId, "OpenSafe")`，
+--    **payload 里没有密码** ⇒ 服务端根本无从校验 ⇒ 直接发这句就能开。
+--
+--  客户端唯一的门：`if LocalPlayer:GetAttribute("currentTeam") == "police"` ——
+--  警察不能抢（那是**本地**提示，不影响发包）。所以非警察身份直接发就行。
+--
+--  同类容器（dump 全扫出来的动词表）：
+--      gizmoType 含 Safe        → gizmoInteraction(id, "OpenSafe")
+--      Suitcase / ShippingCrate → gizmoInteraction(id, "open")
+--      MilitaryChest            → gizmoInteraction(id, "Open")
+--      PelicanCase              → gizmoInteraction(id, "GetTool")
+--      PC Block                 → gizmoInteraction(id, "TakeFlashDrive" / "Search")
+--      LockedMilitaryCrate      → propInteraction(id, "hack")
+--      JewelryVaultDoor         → propInteraction(id, "dismantle" / "unjam" / "placeDrill")
+--      Door / DestructibleGarage→ propInteraction(id, "toggle")
+--
+--  objectId / gizmoType 都是实例上的**属性**（_initModel 里 SetAttribute 挂的），
+--  容器挂在 `workspace.Local.Gizmos` / `workspace.Local.Props` 下。
+-- ==================================================================
+CX_CRACK = CX_CRACK or {}
+CX_CRACK.Radius   = 60        -- 扫描半径（客户端提示距离是 14，服务端是否校验未知）
+CX_CRACK.Interval = 0.35      -- 每个目标之间的间隔（别刷爆 rateLimit）
+CX_CRACK.Done     = 0
+CX_CRACK.Failed   = 0
+CX_CRACK.LastErr  = nil
+CX_CRACK._busy    = false
+
+-- 按 gizmoType / ClassName 决定发什么
+local GIZMO_VERB = {
+	Safe = "OpenSafe", GasStationSafe = "OpenSafe", QuestSafe = "OpenSafe",
+	Suitcase = "open", ShippingCrate = "open", MilitaryChest = "Open",
+	PelicanCase = "GetTool", Briefcase = "open",
+}
+local PROP_VERB = {
+	LockedMilitaryCrate = "hack", JewelryVaultDoor = "dismantle",
+	VaultDoor = "toggle", Door = "toggle", DestructibleGarage = "toggle",
+}
+
+local function fire(name, ...)
+	local net = CX_META and CX_META.Network
+	if net and type(net.FireServer) == "function" then
+		net.FireServer(name, ...)
+		return true
+	end
+	return false
+end
+
+-- 收集范围内所有带 objectId 的容器
+function CX_CRACK.Collect()
+	local out = {}
+	local char = LocalPlayer.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return out end
+	local root = workspace:FindFirstChild("Local")
+	if not root then return out end
+
+	local seen = 0
+	for _, d in ipairs(root:GetDescendants()) do
+		seen = seen + 1
+		if seen > 40000 then break end
+		local ok, id = pcall(function() return d:GetAttribute("objectId") end)
+		if ok and type(id) == "string" then
+			local ok2, gt = pcall(function() return d:GetAttribute("gizmoType") end)
+			local ok3, pos = pcall(function()
+				if d.PrimaryPart then return d.PrimaryPart.Position end
+				if d:IsA("BasePart") then return d.Position end
+				return nil
+			end)
+			if ok3 and pos then
+				local dist = (pos - hrp.Position).Magnitude
+				if dist <= CX_CRACK.Radius then
+					out[#out + 1] = {
+						id = id,
+						gizmoType = ok2 and type(gt) == "string" and gt or nil,
+						class = d.ClassName,
+						dist = dist,
+					}
+				end
+			end
+		end
+	end
+	table.sort(out, function(a, b) return a.dist < b.dist end)
+	return out
+end
+
+-- 决定某个目标该发什么
+function CX_CRACK.VerbFor(t)
+	if t.gizmoType then
+		for k, v in pairs(GIZMO_VERB) do
+			if string.find(t.gizmoType, k, 1, true) then return "gizmoInteraction", v end
+		end
+	end
+	for k, v in pairs(PROP_VERB) do
+		if t.class == k then return "propInteraction", v end
+	end
+	return nil, nil
+end
+
+-- 一键破解范围内所有容器
+function CX_CRACK.RunAll()
+	if CX_CRACK._busy then return 0 end
+	CX_CRACK._busy = true
+	local targets = CX_CRACK.Collect()
+	local n = 0
+	for _, t in ipairs(targets) do
+		local verb, action = CX_CRACK.VerbFor(t)
+		if verb then
+			if fire(verb, t.id, action) then
+				CX_CRACK.Done = CX_CRACK.Done + 1
+				n = n + 1
+			else
+				CX_CRACK.Failed = CX_CRACK.Failed + 1
+				CX_CRACK.LastErr = "Network 未挂上"
+			end
+			task.wait(CX_CRACK.Interval)
+		end
+	end
+	CX_CRACK._busy = false
+	return n
+end
+
+function CX_CRACK.Status()
+	return string.format("已破解 %d 个 / 失败 %d | 半径 %.0f | %s",
+		CX_CRACK.Done, CX_CRACK.Failed, CX_CRACK.Radius,
+		tostring(CX_CRACK.LastErr or "ok"))
+end
 
 -- ===================================================================
 --  弹道绘制（FL_TRACER）
@@ -312,275 +526,183 @@ do
 	end
 end
 
--- ===================================================================
---  飞行（FL_FLY）
---  逻辑来源：用户提供的「飞行源码」
---    · 开：Humanoid 全部状态禁用 + PlatformStand + 冻结动画
---    · 在躯干上挂 BodyGyro（稳朝向）+ BodyVelocity（悬停）
---    · 用移动输入逐帧位移
---    · 关：全部还原 + 销毁两个 mover
+-- ==================================================================
+--  飞行 v3（CX_FLY）—— 走【游戏自己的平台通道】，服务端认可
 --
---  ⚠️ 与源码的两处关键差异，都是为了不被反作弊抓：
+--  ⭐⭐ 挖到底的结论（`ReplicatedStorage.Client.Wanted.Modules.ClientPlatforms`）：
+--     这个游戏有"移动平台"系统 —— 平台 = CollectionService 标签 "Platform" 的部件。
+--     客户端每帧（`stepPlatforms`）做三件事：
+--        ① 射线找脚下最近的 Platform
+--        ② Character:PivotTo(平台本帧位移 * Character.CFrame)          ← 本地移动角色
+--        ③ 每 0.2s：FireServer("updatePlatformUnreliable", 平台, CompressCFrame(角色相对平台的偏移))
+--           （离开平台时 FireServer("updatePlatform", nil)）
 --
---    ① 位移【不再】直接 chr:TranslateBy —— 那是一次赤裸的 CFrame 瞬移，
---       会喂给服务端的 charCheckpoint / charPivotTo 上报通道。
---       改成走 FL_AC.SafePivot（游戏自己的 charPivotTo 入口 +
---       ignoreServer=true + PivotBypass 重入标记），并且【限速调用】
---       （最多 ~30 次/秒，每步按累计 dt 算距离），不是每帧无脑瞬移。
---       FL_AC 不可用时才退回直接写 CFrame。
+--     服务端把角色位置算成 **平台 CFrame × 上报的偏移** ⇒
+--     **它信任客户端报的偏移** —— 而且这是游戏自己每秒 5 次都在发的包，完全不突兀。
 --
---    ② BodyGyro / BodyVelocity 正好在 FL_AC 那份「15 类物理移动器」名单里，
---       所以它们会被 StartSweep 每秒自动打上 UIATC 标记
---       → 在游戏眼里就是"它自己造的实例"。这一点不用额外做。
+--  ⇒ 所以：**先本地移动，再照游戏一模一样的方式上报偏移** = 服务端认可的位移。
+--    这就是"别人能稳定飞"的原理：不是硬写 HRP（会被拉回），是**借用游戏自己的通道**。
 --
---  整层塞进全局表 FL_FLY，不新增顶层 local（Luau 每函数 ≤200 local 的约束）。
--- ===================================================================
+--  ⚠️ 前提：附近要有 Platform 标签的部件（游戏里的移动平台 / 升降台）。
+--     没有的话这条通道用不了，会退化成普通 CFrame 写（那就还是会被拉回）。
+-- ==================================================================
 do
-	local UIS        = game:GetService("UserInputService")
-	local RunService = game:GetService("RunService")
 	local Players    = game:GetService("Players")
+	local RunService = game:GetService("RunService")
+	local UIS        = game:GetService("UserInputService")
+	local CollectionService = game:GetService("CollectionService")
+	local ReplicatedStorage = game:GetService("ReplicatedStorage")
+	local LocalPlayer = Players.LocalPlayer
+	local Camera      = workspace.CurrentCamera
 
-	FL_FLY = FL_FLY or {}
-	FL_FLY.Enabled   = false
-	FL_FLY.Speed     = 40      -- 水平速度（studs/s）
-	FL_FLY.VertSpeed = 30      -- 垂直速度（studs/s）
-	-- true  = 直接写 CFrame / PivotTo（用户要的"cfram 逻辑"：最跟手、零依赖）
-	-- false = 走 FL_AC.SafePivot（游戏自己的 charPivotTo，会同步内部状态）
-	FL_FLY.UseCFrame = true
-	FL_FLY._conn     = nil
-	FL_FLY._movers   = nil
-	FL_FLY._charConn = nil
-	FL_FLY._lastErr  = nil
+	CX_FLY = CX_FLY or {}
+	CX_FLY.Enabled       = false
+	CX_FLY.Speed         = 60
+	CX_FLY.VertSpeed     = 40
+	CX_FLY.MaxStep       = 8      -- 单帧位移上限
+	CX_FLY.ReportRate    = 0.2    -- 上报间隔（和游戏一致）
+	CX_FLY.PlatformRange = 250    -- 找平台的范围
+	CX_FLY.UsePlatform   = true   -- ⭐ 走平台通道（服务端认可）
+	CX_FLY.Platform      = nil
+	CX_FLY.Reports       = 0
+	CX_FLY.Steps         = 0
+	CX_FLY.LastErr       = nil
+	CX_FLY._conn         = nil
+	CX_FLY._lastReport   = 0
 
-	local STATES = {
-		Enum.HumanoidStateType.Climbing,
-		Enum.HumanoidStateType.FallingDown,
-		Enum.HumanoidStateType.Flying,
-		Enum.HumanoidStateType.Freefall,
-		Enum.HumanoidStateType.GettingUp,
-		Enum.HumanoidStateType.Jumping,
-		Enum.HumanoidStateType.Landed,
-		Enum.HumanoidStateType.Physics,
-		Enum.HumanoidStateType.PlatformStanding,
-		Enum.HumanoidStateType.Ragdoll,
-		Enum.HumanoidStateType.Running,
-		Enum.HumanoidStateType.RunningNoPhysics,
-		Enum.HumanoidStateType.Seated,
-		Enum.HumanoidStateType.StrafingNoPhysics,
-		Enum.HumanoidStateType.Swimming,
-	}
+	-- 拿游戏自己的 MathUtil（压缩 CFrame 用；拿不到就发原始 CFrame）
+	local MathUtil
+	pcall(function()
+		MathUtil = require(ReplicatedStorage.Devv).load("MathUtil")
+	end)
 
-	local function localChar()
-		local plr = Players.LocalPlayer
-		local c = plr and plr.Character
-		if not c or not c.Parent then return nil end
-		return c
+	local function key(k)
+		local ok, down = pcall(function() return UIS:IsKeyDown(k) end)
+		return ok and down
 	end
 
-	local function parts()
-		local c = localChar()
-		if not c then return nil end
-		local hum = c:FindFirstChildWhichIsA("Humanoid")
-		local root = c:FindFirstChild("HumanoidRootPart") or c.PrimaryPart
-		-- R6 挂 Torso，R15 挂 UpperTorso；都没有就退到 root
-		local torso = c:FindFirstChild("UpperTorso") or c:FindFirstChild("Torso") or root
-		if not hum or not root or not torso then return nil end
-		return c, hum, root, torso
+	local function moveDir()
+		local cf = Camera and Camera.CFrame
+		if not cf then return nil end
+		local look, right = cf.LookVector, cf.RightVector
+		local fwd = Vector3.new(look.X, 0, look.Z)
+		fwd = fwd.Magnitude > 1e-4 and fwd.Unit or Vector3.new(0, 0, -1)
+		local rt = Vector3.new(right.X, 0, right.Z)
+		rt = rt.Magnitude > 1e-4 and rt.Unit or Vector3.new(1, 0, 0)
+		local d = Vector3.new(0, 0, 0)
+		if key(Enum.KeyCode.W) then d = d + fwd end
+		if key(Enum.KeyCode.S) then d = d - fwd end
+		if key(Enum.KeyCode.D) then d = d + rt end
+		if key(Enum.KeyCode.A) then d = d - rt end
+		return d
 	end
 
-	local function setStates(hum, enabled)
-		for _, st in ipairs(STATES) do
-			pcall(function() hum:SetStateEnabled(st, enabled) end)
-		end
-	end
-
-	local function freezeAnim(char, frozen)
-		local anim = char:FindFirstChild("Animate")
-		if anim then pcall(function() anim.Disabled = frozen end) end
+	-- 找附近带 "Platform" 标签的部件
+	function CX_FLY.FindPlatform()
+		local char = LocalPlayer.Character
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		if not hrp then return nil end
+		local best, bestD = nil, CX_FLY.PlatformRange
 		pcall(function()
-			local h = char:FindFirstChildOfClass("Humanoid")
-				or char:FindFirstChildOfClass("AnimationController")
-			if not h then return end
-			for _, t in next, h:GetPlayingAnimationTracks() do
-				if frozen then
-					pcall(function() t:AdjustSpeed(0) end)
-				else
-					pcall(function() t:AdjustSpeed(1) end)
+			for _, p in ipairs(CollectionService:GetTagged("Platform")) do
+				if p and p.Parent and p:IsA("BasePart") then
+					local d = (p.Position - hrp.Position).Magnitude
+					if d < bestD then best, bestD = p, d end
 				end
 			end
 		end)
+		return best
 	end
 
-	-- 移动方向：优先读 WASD 自己算（不依赖 PlatformStand 下 MoveDirection 是否还更新），
-	-- 没有按键时退回 Humanoid.MoveDirection（手柄 / 摇杆）。
-	local function moveDir(hum)
-		local f, r = 0, 0
-		if UIS:IsKeyDown(Enum.KeyCode.W) then f = f + 1 end
-		if UIS:IsKeyDown(Enum.KeyCode.S) then f = f - 1 end
-		if UIS:IsKeyDown(Enum.KeyCode.D) then r = r + 1 end
-		if UIS:IsKeyDown(Enum.KeyCode.A) then r = r - 1 end
-		if f == 0 and r == 0 then
-			local md = hum.MoveDirection
-			if md and md.Magnitude > 0.01 then return md end
-			return Vector3.zero
+	function CX_FLY.Step(dt)
+		dt = tonumber(dt) or (1 / 60)
+		local char = LocalPlayer.Character
+		if not char then CX_FLY.LastErr = "没有角色" return end
+		local hrp = char:FindFirstChild("HumanoidRootPart")
+		if not hrp then CX_FLY.LastErr = "没有 HRP" return end
+
+		local dir = moveDir()
+		local vertical = 0
+		if key(Enum.KeyCode.Space) then vertical = vertical + 1 end
+		if key(Enum.KeyCode.LeftControl) or key(Enum.KeyCode.LeftShift) then vertical = vertical - 1 end
+
+		local step = Vector3.new(0, 0, 0)
+		if dir and dir.Magnitude > 0 then
+			step = step + dir.Unit * (CX_FLY.Speed * dt)
 		end
-		local cam = workspace.CurrentCamera
-		if not cam then return Vector3.zero end
-		local lv = cam.CFrame.LookVector
-		local rv = cam.CFrame.RightVector
-		local fl = Vector3.new(lv.X, 0, lv.Z)
-		local fr = Vector3.new(rv.X, 0, rv.Z)
-		if fl.Magnitude < 1e-4 then fl = Vector3.new(0, 0, -1) end
-		if fr.Magnitude < 1e-4 then fr = Vector3.new(1, 0, 0) end
-		local v = fl.Unit * f + fr.Unit * r
-		if v.Magnitude < 1e-4 then return Vector3.zero end
-		return v.Unit * math.min(1, math.sqrt(f * f + r * r))
-	end
-
-	local function vertical()
-		local v = 0
-		if UIS:IsKeyDown(Enum.KeyCode.Space) then v = v + 1 end
-		if UIS:IsKeyDown(Enum.KeyCode.LeftControl)
-			or UIS:IsKeyDown(Enum.KeyCode.RightControl) then v = v - 1 end
-		return v
-	end
-
-	-- 位移。两种模式：
-	--   UseCFrame = true  → 直接写 CFrame（root + 整具 PivotTo），最跟手
-	--   UseCFrame = false → 走 FL_AC.SafePivot（游戏自己的入口，会同步内部状态）
-	local function moveTo(char, root, target)
-		if not FL_FLY.UseCFrame and FL_AC and type(FL_AC.SafePivot) == "function" then
-			local ok, done = pcall(FL_AC.SafePivot, target)
-			if ok and done then return true end
+		step = step + Vector3.new(0, vertical * (CX_FLY.VertSpeed * dt), 0)
+		if step.Magnitude > CX_FLY.MaxStep then
+			step = step.Unit * CX_FLY.MaxStep
 		end
-		local cf = CFrame.new(target, target + (root.CFrame.LookVector or Vector3.new(0, 0, -1)))
-		local ok = pcall(function() root.CFrame = cf end)
-		if not ok then
-			ok = pcall(function() root.CFrame = CFrame.new(target) end)
+		if step.Magnitude <= 1e-6 then return end
+
+		-- ① 本地移动（保留朝向，和游戏一样）
+		local ok = pcall(function() hrp.CFrame = hrp.CFrame + step end)
+		if not ok then CX_FLY.LastErr = "写 CFrame 失败" return end
+		CX_FLY.Steps = CX_FLY.Steps + 1
+
+		-- ② 照游戏的方式上报偏移（服务端据此认下这个位置）
+		if not CX_FLY.UsePlatform then return end
+		local plat = CX_FLY.Platform
+		if not (plat and plat.Parent) then
+			plat = CX_FLY.FindPlatform()
+			CX_FLY.Platform = plat
 		end
-		-- 整具一起挪（避免部件之间被物理拉开）
-		pcall(function() char:PivotTo(cf) end)
-		return ok
-	end
-
-	function FL_FLY.Step(dt)
-		if not FL_FLY.Enabled then return end
-		local char, hum, root = parts()
-		if not char or not hum or not root then return end
-
-		local dir = moveDir(hum) * FL_FLY.Speed
-		local vy = vertical() * FL_FLY.VertSpeed
-		if vy ~= 0 then dir = dir + Vector3.new(0, vy, 0) end
-
-		local m = FL_FLY._movers
-		if dir.Magnitude < 0.01 then
-			-- 悬停：物理速度归零，别往下掉
-			if m and m.bv then pcall(function() m.bv.Velocity = Vector3.zero end) end
+		if not plat then
+			CX_FLY.LastErr = "附近没有 Platform 标签的部件（这条通道用不了）"
 			return
 		end
 
-		local target = root.Position + dir * dt
-		moveTo(char, root, target)
+		local now = os.clock()
+		if now - CX_FLY._lastReport < CX_FLY.ReportRate then return end
+		CX_FLY._lastReport = now
 
-		-- 位置完全由我们控制，别让 BodyVelocity 再推一次
-		if m and m.bv then pcall(function() m.bv.Velocity = Vector3.zero end) end
-		if m and m.bg then pcall(function() m.bg.CFrame = CFrame.new(target) end) end
+		local net = CX_META and CX_META.Network
+		if not (net and type(net.FireServer) == "function") then
+			CX_FLY.LastErr = "Network 未挂上"
+			return
+		end
+
+		local offset = plat:GetPivot():ToObjectSpace(hrp.CFrame)
+		local payload = offset
+		if MathUtil and type(MathUtil.CompressCFrame) == "function" then
+			local okc, c = pcall(MathUtil.CompressCFrame, offset)
+			if okc and c then payload = c end
+		end
+		net.FireServer("updatePlatformUnreliable", plat, payload)
+		CX_FLY.Reports = CX_FLY.Reports + 1
+		CX_FLY.LastErr = nil
 	end
 
-	function FL_FLY.Start()
-		local char, hum, _, torso = parts()
-		if not char or not hum then return false end
-
-		freezeAnim(char, true)
-		setStates(hum, false)
-		pcall(function() hum:ChangeState(Enum.HumanoidStateType.Swimming) end)
-		pcall(function() hum.PlatformStand = true end)
-
-		local bg = Instance.new("BodyGyro")
-		bg.Name = "FLFlyGyro"
-		bg.P = 9e4
-		bg.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
-		bg.CFrame = torso.CFrame
-		bg.Parent = torso
-
-		local bv = Instance.new("BodyVelocity")
-		bv.Name = "FLFlyVel"
-		bv.Velocity = Vector3.zero
-		bv.MaxForce = Vector3.new(9e9, 9e9, 9e9)
-		bv.Parent = torso
-
-		FL_FLY._movers = { bg = bg, bv = bv, torso = torso }
-		return true
-	end
-
-	function FL_FLY.Stop()
-		FL_FLY.Enabled = false
-		if FL_FLY._conn then
-			pcall(function() FL_FLY._conn:Disconnect() end)
-			FL_FLY._conn = nil
+	function CX_FLY.Set(on)
+		CX_FLY.Enabled = on and true or false
+		if CX_FLY._conn then
+			CX_FLY._conn:Disconnect()
+			CX_FLY._conn = nil
 		end
-		local m = FL_FLY._movers
-		if m then
-			pcall(function() if m.bg then m.bg:Destroy() end end)
-			pcall(function() if m.bv then m.bv:Destroy() end end)
-			FL_FLY._movers = nil
-		end
-		local char, hum = parts()
-		if char then
-			freezeAnim(char, false)
-			if hum then
-				setStates(hum, true)
-				pcall(function() hum:ChangeState(Enum.HumanoidStateType.RunningNoPhysics) end)
-				pcall(function() hum.PlatformStand = false end)
-			end
-		end
-	end
-
-	function FL_FLY.Set(on)
-		if not on then
-			FL_FLY.Stop()
-			return true
-		end
-		if FL_FLY.Enabled then return true end
-		if not FL_FLY.Start() then
-			FL_FLY._lastErr = "没有角色"
-			return false
-		end
-		FL_FLY.Enabled = true
-		FL_FLY._lastErr = nil
-
-		-- 限速调用：最多 ~30 次/秒，每步用累计 dt 算距离（速度因此与帧率无关）
-		local acc = 0
-		FL_FLY._conn = RunService.Heartbeat:Connect(function(dt)
-			if not FL_FLY.Enabled then return end
-			acc = acc + dt
-			if acc < 0.033 then return end
-			local step = acc
-			acc = 0
-			pcall(FL_FLY.Step, step)
-		end)
-
-		-- 重生 / 换角色：飞行状态作废，自动收干净（否则会留下 PlatformStand 和 mover）
-		if not FL_FLY._charConn then
-			FL_FLY._charConn = Players.LocalPlayer.CharacterAdded:Connect(function()
-				if FL_FLY.Enabled then FL_FLY.Stop() end
+		if not CX_FLY.Enabled then
+			-- 退出时照游戏的做法清一次
+			pcall(function()
+				local net = CX_META and CX_META.Network
+				if net and type(net.FireServer) == "function" then
+					net.FireServer("updatePlatform", nil)
+				end
 			end)
+			CX_FLY.Platform = nil
+			return
 		end
-		return true
+		CX_FLY._conn = RunService.RenderStepped:Connect(function(dt)
+			if CX_FLY.Enabled then
+				pcall(CX_FLY.Step, dt)
+			end
+		end)
 	end
 
-	function FL_FLY.Status()
-		local _, hum, root = parts()
-		return {
-			Enabled  = FL_FLY.Enabled,
-			Speed    = FL_FLY.Speed,
-			VertSpeed= FL_FLY.VertSpeed,
-			UseCFrame= FL_FLY.UseCFrame,
-			HasChar  = root ~= nil,
-			PlatformStand = hum and hum.PlatformStand or false,
-			Movers   = FL_FLY._movers ~= nil,
-			LastErr  = FL_FLY._lastErr,
-		}
+	function CX_FLY.Status()
+		return string.format("飞行=%s 平台通道=%s 平台=%s | 位移=%d 上报=%d | %s",
+			tostring(CX_FLY.Enabled), tostring(CX_FLY.UsePlatform),
+			tostring(CX_FLY.Platform and CX_FLY.Platform.Name or "无"),
+			CX_FLY.Steps, CX_FLY.Reports, tostring(CX_FLY.LastErr or "ok"))
 	end
 end
 
@@ -951,11 +1073,24 @@ end
 local currentTarget = nil
 local bulletTracers = {}
 
--- [改造] 弹道绘制改用 CS:GO 那套（FL_TRACER：三层 beam + 停留 + 飘散）
 local function spawnBulletTracer(fromPos, toPos)
-    if FL_TRACER and FL_TRACER.Spawn then
-        pcall(FL_TRACER.Spawn, fromPos, toPos)
-    end
+    local part = Instance.new("Part")
+    part.Anchored = true
+    part.CanCollide = false
+    part.Material = Enum.Material.Neon
+    part.Color = Color3.fromRGB(255, 255, 100)
+    part.Transparency = 0.3
+    part.Size = Vector3.new(0.15, 0.15, (toPos - fromPos).Magnitude)
+    part.CFrame = CFrame.lookAt(fromPos, toPos) * CFrame.new(0, 0, -(toPos - fromPos).Magnitude / 2)
+    part.Parent = Workspace
+    local conn
+    conn = RunService.Heartbeat:Connect(function()
+        part.Transparency = part.Transparency + 0.05
+        if part.Transparency >= 1 then
+            part:Destroy()
+            conn:Disconnect()
+        end
+    end)
 end
 
 local ragebotTarget = nil
@@ -1530,16 +1665,23 @@ playWelcome(function()
     end })
 
 
-    -- ===================== 飞行（FL_FLY）=====================
+    -- ===================== 飞行（CX_FLY · 走平台通道）=====================
     local s9 = tabSettings:Section("飞行")
     s9:Toggle({ Name = "飞行", Default = false,
-        Callback = function(on) FL_FLY.Set(on) end })
-    s9:Slider({ Name = "飞行速度", Default = 40, Min = 5, Max = 300,
-        Callback = function(v) FL_FLY.Speed = v end })
-    s9:Slider({ Name = "飞行升降速度", Default = 30, Min = 5, Max = 200,
-        Callback = function(v) FL_FLY.VertSpeed = v end })
-    s9:Toggle({ Name = "飞行用 CFrame 直写", Default = true,
-        Callback = function(v) FL_FLY.UseCFrame = v end })
+        Callback = function(on) CX_FLY.Set(on) end })
+    s9:Toggle({ Name = "走平台通道（服务端认可）", Default = true,
+        Callback = function(v) CX_FLY.UsePlatform = v end })
+    s9:Slider({ Name = "飞行速度", Default = 60, Min = 5, Max = 300,
+        Callback = function(v) CX_FLY.Speed = v end })
+    s9:Slider({ Name = "飞行升降速度", Default = 40, Min = 5, Max = 200,
+        Callback = function(v) CX_FLY.VertSpeed = v end })
+    s9:Slider({ Name = "单帧位移上限", Default = 8, Min = 1, Max = 40,
+        Callback = function(v) CX_FLY.MaxStep = v end })
+    s9:Slider({ Name = "找平台范围", Default = 250, Min = 20, Max = 2000,
+        Callback = function(v) CX_FLY.PlatformRange = v end })
+    s9:Button({ Name = "自检：飞行状态", Callback = function()
+        w(CX_FLY.Status())
+    end })
 
     local s7 = tabSettings:Section("关于")
     s7:Button({Name = "Devv: " .. tostring(devvReady), Callback = function() end})
