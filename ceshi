@@ -1,3 +1,589 @@
+
+-- ==================================================================
+--  CX 绕过层（元表 hook + Network 收口）
+-- ==================================================================
+CX_META = CX_META or {}
+CX_META.Enabled = true
+CX_META.Dropped = 0
+CX_META.Blocked = {
+	fling = true, resetVelocity = true, spectatePlayer = true,
+	reconnectPlayer = true, resetCharacter = true,
+}
+CX_META.GuardSpeed = true
+CX_META.GuardVelocity = true
+CX_META.Network = nil
+CX_META._nc = nil
+CX_META._ni = nil
+
+local _A = {
+	getrawmetatable   = getrawmetatable,
+	setreadonly       = setreadonly,
+	getnamecallmethod = getnamecallmethod,
+	hookmetamethod    = hookmetamethod,
+}
+
+local function _drop(name)
+	if CX_META.Enabled and type(name) == "string" and CX_META.Blocked[name] then
+		CX_META.Dropped = CX_META.Dropped + 1
+		return true
+	end
+	return false
+end
+
+function CX_META.Install()
+	-- ① Network 收口（唯一能拿到真名的地方）
+	pcall(function()
+		local net = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared")
+			:WaitForChild("Core"):WaitForChild("Network"))
+		if type(net) == "table" then
+			CX_META.Network = net
+			local oldFire = net.FireServer
+			if type(oldFire) == "function" then
+				net.FireServer = function(name, ...)
+					if _drop(name) then return nil end
+					return oldFire(name, ...)
+				end
+			end
+			local oldInvoke = net.InvokeServer
+			if type(oldInvoke) == "function" then
+				net.InvokeServer = function(name, ...)
+					if _drop(name) then return nil end
+					return oldInvoke(name, ...)
+				end
+			end
+		end
+	end)
+
+	-- ② 元表 hook
+	local ok, mt = pcall(_A.getrawmetatable, game)
+	if not ok or type(mt) ~= "table" then return CX_META.Network ~= nil end
+	local oldNC = rawget(mt, "__namecall")
+	local oldNI = rawget(mt, "__newindex")
+	pcall(_A.setreadonly, mt, false)
+
+	if type(oldNC) == "function" and not CX_META._nc then
+		CX_META._nc = function(self, ...)
+			if CX_META.Enabled and _A.getnamecallmethod() == "FireServer" then
+				if _drop(select(1, ...)) then return nil end
+			end
+			return oldNC(self, ...)
+		end
+		pcall(function() mt.__namecall = CX_META._nc end)
+	end
+
+	if type(oldNI) == "function" and not CX_META._ni then
+		CX_META._ni = function(self, key, value)
+			if CX_META.Enabled then
+				local okI, isInst = pcall(function() return typeof(self) == "Instance" end)
+				if okI and isInst then
+					if CX_META.GuardSpeed and key == "WalkSpeed" then
+						local okH, isHum = pcall(function() return self:IsA("Humanoid") end)
+						if okH and isHum then return nil end
+					end
+					if CX_META.GuardVelocity and (key == "AssemblyLinearVelocity"
+						or key == "AssemblyAngularVelocity") then
+						local okP, isPart = pcall(function() return self:IsA("BasePart") end)
+						if okP and isPart then return nil end
+					end
+				end
+			end
+			return oldNI(self, key, value)
+		end
+		pcall(function() mt.__newindex = CX_META._ni end)
+	end
+
+	pcall(_A.setreadonly, mt, true)
+
+	-- ③ 老执行器退路
+	if not CX_META._nc and type(_A.hookmetamethod) == "function" then
+		pcall(function()
+			local old = _A.hookmetamethod(game, "__namecall", function(self, ...)
+				if _drop(select(1, ...)) then return nil end
+				return old(self, ...)
+			end)
+			CX_META._nc = true
+		end)
+	end
+
+	return true
+end
+
+pcall(CX_META.Install)
+
+-- ===================================================================
+--  弹道绘制（FL_TRACER）
+--
+--  视觉照搬 csgo 版那套「破空」三层 Beam（细亮芯 + 中层 + 外层柔光，
+--  都朝目标端收窄），但**整体比 csgo 细一半**（Scale = 0.5）。
+--
+--  触发源：游戏每次开枪都会上报
+--      PlayerEvent:FireServer("bullet", { pos = <命中点>, posDestroyX = <X>, weaponName = <枪名> })
+--  （dump 782961 / 792485 / 801991 / 811930 / 821611 / 831283 —— 六条武器分支都会发）
+--  FL_AC 的 __namecall 已经拦着 PlayerEvent，这里只是挂一个 FL_AC.OnBullet 回调，
+--  **没开弹道绘制时那个分支直接短路，全局钩子零额外成本**。
+--
+--  起点：优先找枪械模型上的枪口（Barrel / Muzzle 附件），
+--        找不到就退到相机位置（第一人称下就是眼睛，视觉上同样对）。
+--
+--  整层塞进全局表 FL_TRACER，不新增顶层 local。
+-- ===================================================================
+do
+	local RunService = game:GetService("RunService")
+	local Players    = game:GetService("Players")
+	local LocalPlayer = Players.LocalPlayer
+
+	FL_TRACER = FL_TRACER or {}
+	FL_TRACER.Enabled = false
+	FL_TRACER.Hold    = 3        -- 停留（秒）
+	FL_TRACER.Drift   = 1.2      -- 飘散（秒）
+	FL_TRACER.Scale   = 0.5      -- 粗细系数（csgo 版是 1.0，这里细一半）
+	FL_TRACER.MaxLive = 40       -- 同时存在的弹道上限
+	FL_TRACER.Folder  = nil
+	FL_TRACER.Count   = 0
+
+	local MUZZLE_NAMES = { "Barrel", "Muzzle", "MuzzlePart", "MuzzleAttachment", "Tip" }
+
+	local function folder()
+		if FL_TRACER.Folder and FL_TRACER.Folder.Parent then
+			return FL_TRACER.Folder
+		end
+		local f = workspace:FindFirstChild("FL_Tracers")
+		if not f then
+			f = Instance.new("Folder")
+			f.Name = "FL_Tracers"
+			f.Parent = workspace
+		end
+		FL_TRACER.Folder = f
+		return f
+	end
+
+	-- 枪口：角色下带 Config 的武器模型 → 找 MUZZLE_NAMES 里的 BasePart 或 Attachment
+	local function muzzlePos()
+		local char = LocalPlayer.Character
+		if char then
+			for _, d in ipairs(char:GetDescendants()) do
+				if d:IsA("ModuleScript") and d.Name == "Config" and d.Parent then
+					for _, n in ipairs(MUZZLE_NAMES) do
+						local m = d.Parent:FindFirstChild(n, true)
+						if m then
+							if m:IsA("BasePart") then return m.Position end
+							if m:IsA("Attachment") then return m.WorldPosition end
+						end
+					end
+				end
+			end
+		end
+		local cam = workspace.CurrentCamera
+		if cam then return cam.CFrame.Position end
+		return nil
+	end
+
+	local function newPoint(parent, pos)
+		local part = Instance.new("Part")
+		part.Name = "TracerPoint"
+		part.Anchored = true
+		part.CanCollide = false
+		part.CanQuery   = false     -- 🔴 必须：否则弹道会挡住自己的子弹和射线
+		part.CanTouch   = false
+		part.CastShadow = false
+		part.Transparency = 1
+		part.Size = Vector3.new(0.05, 0.05, 0.05)
+		part.CFrame = CFrame.new(pos)
+		part.Parent = parent
+		local att = Instance.new("Attachment")
+		att.Name = "TracerAttach"
+		att.Parent = part
+		return part, att
+	end
+
+	-- 三层叠加做「破空」：都朝目标端收窄（Width1 < Width0）。
+	-- ⚠️ 数值 = csgo 版 × Scale（默认 0.5 → 细一半）。
+	local function newBeam(parent, a0, a1, w0, w1, transparency, emission)
+		local k = tonumber(FL_TRACER.Scale) or 0.5
+		local beam = Instance.new("Beam")
+		beam.Name = "TracerBeam"
+		beam.Attachment0 = a0
+		beam.Attachment1 = a1
+		beam.Width0 = w0 * k
+		beam.Width1 = w1 * k
+		beam.Segments = 1
+		beam.FaceCamera = true
+		beam.LightEmission = emission
+		beam.LightInfluence = 0      -- 不吃环境光 → 暗处也是纯白
+		beam.Color = ColorSequence.new(Color3.new(1, 1, 1))
+		beam.Transparency = NumberSequence.new(transparency)
+		beam.Parent = parent
+		return beam
+	end
+
+	local function spawnTracer(from, to)
+		if typeof(from) ~= "Vector3" or typeof(to) ~= "Vector3" then return end
+		if (to - from).Magnitude < 2 then return end
+		local f = folder()
+		if not f then return end
+
+		-- 并发上限：连射时不堆爆
+		local kids = f:GetChildren()
+		if #kids >= FL_TRACER.MaxLive then
+			for i = 1, #kids - FL_TRACER.MaxLive + 1 do
+				pcall(function() kids[i]:Destroy() end)
+			end
+		end
+
+		local holder = Instance.new("Folder")
+		holder.Name = "Tracer"
+		holder.Parent = f
+		FL_TRACER.Count = FL_TRACER.Count + 1
+
+		local p0, a0 = newPoint(holder, from)
+		local p1, a1 = newPoint(holder, to)
+
+		local core = newBeam(holder, a0, a1, 0.20, 0.06, 0.00, 1.00)
+		local mid  = newBeam(holder, a0, a1, 0.55, 0.20, 0.72, 0.80)
+		local halo = newBeam(holder, a0, a1, 1.30, 0.45, 0.88, 0.45)
+		local k = tonumber(FL_TRACER.Scale) or 0.5
+
+		task.spawn(function()
+			task.wait(math.max(0.1, tonumber(FL_TRACER.Hold) or 3))
+			if not holder.Parent then return end
+
+			local drift = math.max(0.1, tonumber(FL_TRACER.Drift) or 1.2)
+			local up = Vector3.new(0, 1, 0)
+			local t = 0
+			while t < drift do
+				local dt = RunService.Heartbeat:Wait()
+				if not holder.Parent then return end
+				t = t + dt
+				local e = math.clamp(t / drift, 0, 1)
+				e = e * e                    -- 越到后面散得越快
+				core.Transparency = NumberSequence.new(e)
+				mid.Transparency  = NumberSequence.new(0.72 + 0.28 * e)
+				halo.Transparency = NumberSequence.new(0.88 + 0.12 * e)
+				core.Width0 = 0.20 * k * (1 - 0.55 * e); core.Width1 = 0.06 * k * (1 - 0.55 * e)
+				mid.Width0  = 0.55 * k * (1 + 2.6 * e);  mid.Width1  = 0.20 * k * (1 + 2.6 * e)
+				halo.Width0 = 1.30 * k * (1 + 3.2 * e);  halo.Width1 = 0.45 * k * (1 + 3.2 * e)
+				local shift = up * (1.4 * e)
+				p0.CFrame = CFrame.new(from + shift)
+				p1.CFrame = CFrame.new(to + shift * 1.8)
+			end
+			holder:Destroy()
+		end)
+	end
+	FL_TRACER.Spawn = spawnTracer
+
+	-- FL_AC 的 __namecall 会在收到 "bullet" 上报时调这里
+	function FL_TRACER.OnBullet(payload)
+		if not FL_TRACER.Enabled then return end
+		if type(payload) ~= "table" then return end
+		local to = payload.pos
+		if typeof(to) ~= "Vector3" then return end
+		local from = muzzlePos()
+		if not from then return end
+		pcall(spawnTracer, from, to)
+	end
+
+	function FL_TRACER.Set(on)
+		FL_TRACER.Enabled = on and true or false
+		if FL_TRACER.Enabled then
+			folder()
+			if FL_AC then FL_AC.OnBullet = FL_TRACER.OnBullet end
+		else
+			if FL_AC then FL_AC.OnBullet = nil end
+			local f = FL_TRACER.Folder
+			if f then
+				for _, c in ipairs(f:GetChildren()) do
+					pcall(function() c:Destroy() end)
+				end
+			end
+		end
+		return FL_TRACER.Enabled
+	end
+
+	function FL_TRACER.Status()
+		return {
+			Enabled  = FL_TRACER.Enabled,
+			Hooked   = (FL_AC and FL_AC.OnBullet ~= nil) or false,
+			Scale    = FL_TRACER.Scale,
+			Hold     = FL_TRACER.Hold,
+			Drift    = FL_TRACER.Drift,
+			Live     = FL_TRACER.Folder and #FL_TRACER.Folder:GetChildren() or 0,
+			Count    = FL_TRACER.Count,
+		}
+	end
+end
+
+-- ===================================================================
+--  飞行（FL_FLY）
+--  逻辑来源：用户提供的「飞行源码」
+--    · 开：Humanoid 全部状态禁用 + PlatformStand + 冻结动画
+--    · 在躯干上挂 BodyGyro（稳朝向）+ BodyVelocity（悬停）
+--    · 用移动输入逐帧位移
+--    · 关：全部还原 + 销毁两个 mover
+--
+--  ⚠️ 与源码的两处关键差异，都是为了不被反作弊抓：
+--
+--    ① 位移【不再】直接 chr:TranslateBy —— 那是一次赤裸的 CFrame 瞬移，
+--       会喂给服务端的 charCheckpoint / charPivotTo 上报通道。
+--       改成走 FL_AC.SafePivot（游戏自己的 charPivotTo 入口 +
+--       ignoreServer=true + PivotBypass 重入标记），并且【限速调用】
+--       （最多 ~30 次/秒，每步按累计 dt 算距离），不是每帧无脑瞬移。
+--       FL_AC 不可用时才退回直接写 CFrame。
+--
+--    ② BodyGyro / BodyVelocity 正好在 FL_AC 那份「15 类物理移动器」名单里，
+--       所以它们会被 StartSweep 每秒自动打上 UIATC 标记
+--       → 在游戏眼里就是"它自己造的实例"。这一点不用额外做。
+--
+--  整层塞进全局表 FL_FLY，不新增顶层 local（Luau 每函数 ≤200 local 的约束）。
+-- ===================================================================
+do
+	local UIS        = game:GetService("UserInputService")
+	local RunService = game:GetService("RunService")
+	local Players    = game:GetService("Players")
+
+	FL_FLY = FL_FLY or {}
+	FL_FLY.Enabled   = false
+	FL_FLY.Speed     = 40      -- 水平速度（studs/s）
+	FL_FLY.VertSpeed = 30      -- 垂直速度（studs/s）
+	-- true  = 直接写 CFrame / PivotTo（用户要的"cfram 逻辑"：最跟手、零依赖）
+	-- false = 走 FL_AC.SafePivot（游戏自己的 charPivotTo，会同步内部状态）
+	FL_FLY.UseCFrame = true
+	FL_FLY._conn     = nil
+	FL_FLY._movers   = nil
+	FL_FLY._charConn = nil
+	FL_FLY._lastErr  = nil
+
+	local STATES = {
+		Enum.HumanoidStateType.Climbing,
+		Enum.HumanoidStateType.FallingDown,
+		Enum.HumanoidStateType.Flying,
+		Enum.HumanoidStateType.Freefall,
+		Enum.HumanoidStateType.GettingUp,
+		Enum.HumanoidStateType.Jumping,
+		Enum.HumanoidStateType.Landed,
+		Enum.HumanoidStateType.Physics,
+		Enum.HumanoidStateType.PlatformStanding,
+		Enum.HumanoidStateType.Ragdoll,
+		Enum.HumanoidStateType.Running,
+		Enum.HumanoidStateType.RunningNoPhysics,
+		Enum.HumanoidStateType.Seated,
+		Enum.HumanoidStateType.StrafingNoPhysics,
+		Enum.HumanoidStateType.Swimming,
+	}
+
+	local function localChar()
+		local plr = Players.LocalPlayer
+		local c = plr and plr.Character
+		if not c or not c.Parent then return nil end
+		return c
+	end
+
+	local function parts()
+		local c = localChar()
+		if not c then return nil end
+		local hum = c:FindFirstChildWhichIsA("Humanoid")
+		local root = c:FindFirstChild("HumanoidRootPart") or c.PrimaryPart
+		-- R6 挂 Torso，R15 挂 UpperTorso；都没有就退到 root
+		local torso = c:FindFirstChild("UpperTorso") or c:FindFirstChild("Torso") or root
+		if not hum or not root or not torso then return nil end
+		return c, hum, root, torso
+	end
+
+	local function setStates(hum, enabled)
+		for _, st in ipairs(STATES) do
+			pcall(function() hum:SetStateEnabled(st, enabled) end)
+		end
+	end
+
+	local function freezeAnim(char, frozen)
+		local anim = char:FindFirstChild("Animate")
+		if anim then pcall(function() anim.Disabled = frozen end) end
+		pcall(function()
+			local h = char:FindFirstChildOfClass("Humanoid")
+				or char:FindFirstChildOfClass("AnimationController")
+			if not h then return end
+			for _, t in next, h:GetPlayingAnimationTracks() do
+				if frozen then
+					pcall(function() t:AdjustSpeed(0) end)
+				else
+					pcall(function() t:AdjustSpeed(1) end)
+				end
+			end
+		end)
+	end
+
+	-- 移动方向：优先读 WASD 自己算（不依赖 PlatformStand 下 MoveDirection 是否还更新），
+	-- 没有按键时退回 Humanoid.MoveDirection（手柄 / 摇杆）。
+	local function moveDir(hum)
+		local f, r = 0, 0
+		if UIS:IsKeyDown(Enum.KeyCode.W) then f = f + 1 end
+		if UIS:IsKeyDown(Enum.KeyCode.S) then f = f - 1 end
+		if UIS:IsKeyDown(Enum.KeyCode.D) then r = r + 1 end
+		if UIS:IsKeyDown(Enum.KeyCode.A) then r = r - 1 end
+		if f == 0 and r == 0 then
+			local md = hum.MoveDirection
+			if md and md.Magnitude > 0.01 then return md end
+			return Vector3.zero
+		end
+		local cam = workspace.CurrentCamera
+		if not cam then return Vector3.zero end
+		local lv = cam.CFrame.LookVector
+		local rv = cam.CFrame.RightVector
+		local fl = Vector3.new(lv.X, 0, lv.Z)
+		local fr = Vector3.new(rv.X, 0, rv.Z)
+		if fl.Magnitude < 1e-4 then fl = Vector3.new(0, 0, -1) end
+		if fr.Magnitude < 1e-4 then fr = Vector3.new(1, 0, 0) end
+		local v = fl.Unit * f + fr.Unit * r
+		if v.Magnitude < 1e-4 then return Vector3.zero end
+		return v.Unit * math.min(1, math.sqrt(f * f + r * r))
+	end
+
+	local function vertical()
+		local v = 0
+		if UIS:IsKeyDown(Enum.KeyCode.Space) then v = v + 1 end
+		if UIS:IsKeyDown(Enum.KeyCode.LeftControl)
+			or UIS:IsKeyDown(Enum.KeyCode.RightControl) then v = v - 1 end
+		return v
+	end
+
+	-- 位移。两种模式：
+	--   UseCFrame = true  → 直接写 CFrame（root + 整具 PivotTo），最跟手
+	--   UseCFrame = false → 走 FL_AC.SafePivot（游戏自己的入口，会同步内部状态）
+	local function moveTo(char, root, target)
+		if not FL_FLY.UseCFrame and FL_AC and type(FL_AC.SafePivot) == "function" then
+			local ok, done = pcall(FL_AC.SafePivot, target)
+			if ok and done then return true end
+		end
+		local cf = CFrame.new(target, target + (root.CFrame.LookVector or Vector3.new(0, 0, -1)))
+		local ok = pcall(function() root.CFrame = cf end)
+		if not ok then
+			ok = pcall(function() root.CFrame = CFrame.new(target) end)
+		end
+		-- 整具一起挪（避免部件之间被物理拉开）
+		pcall(function() char:PivotTo(cf) end)
+		return ok
+	end
+
+	function FL_FLY.Step(dt)
+		if not FL_FLY.Enabled then return end
+		local char, hum, root = parts()
+		if not char or not hum or not root then return end
+
+		local dir = moveDir(hum) * FL_FLY.Speed
+		local vy = vertical() * FL_FLY.VertSpeed
+		if vy ~= 0 then dir = dir + Vector3.new(0, vy, 0) end
+
+		local m = FL_FLY._movers
+		if dir.Magnitude < 0.01 then
+			-- 悬停：物理速度归零，别往下掉
+			if m and m.bv then pcall(function() m.bv.Velocity = Vector3.zero end) end
+			return
+		end
+
+		local target = root.Position + dir * dt
+		moveTo(char, root, target)
+
+		-- 位置完全由我们控制，别让 BodyVelocity 再推一次
+		if m and m.bv then pcall(function() m.bv.Velocity = Vector3.zero end) end
+		if m and m.bg then pcall(function() m.bg.CFrame = CFrame.new(target) end) end
+	end
+
+	function FL_FLY.Start()
+		local char, hum, _, torso = parts()
+		if not char or not hum then return false end
+
+		freezeAnim(char, true)
+		setStates(hum, false)
+		pcall(function() hum:ChangeState(Enum.HumanoidStateType.Swimming) end)
+		pcall(function() hum.PlatformStand = true end)
+
+		local bg = Instance.new("BodyGyro")
+		bg.Name = "FLFlyGyro"
+		bg.P = 9e4
+		bg.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+		bg.CFrame = torso.CFrame
+		bg.Parent = torso
+
+		local bv = Instance.new("BodyVelocity")
+		bv.Name = "FLFlyVel"
+		bv.Velocity = Vector3.zero
+		bv.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+		bv.Parent = torso
+
+		FL_FLY._movers = { bg = bg, bv = bv, torso = torso }
+		return true
+	end
+
+	function FL_FLY.Stop()
+		FL_FLY.Enabled = false
+		if FL_FLY._conn then
+			pcall(function() FL_FLY._conn:Disconnect() end)
+			FL_FLY._conn = nil
+		end
+		local m = FL_FLY._movers
+		if m then
+			pcall(function() if m.bg then m.bg:Destroy() end end)
+			pcall(function() if m.bv then m.bv:Destroy() end end)
+			FL_FLY._movers = nil
+		end
+		local char, hum = parts()
+		if char then
+			freezeAnim(char, false)
+			if hum then
+				setStates(hum, true)
+				pcall(function() hum:ChangeState(Enum.HumanoidStateType.RunningNoPhysics) end)
+				pcall(function() hum.PlatformStand = false end)
+			end
+		end
+	end
+
+	function FL_FLY.Set(on)
+		if not on then
+			FL_FLY.Stop()
+			return true
+		end
+		if FL_FLY.Enabled then return true end
+		if not FL_FLY.Start() then
+			FL_FLY._lastErr = "没有角色"
+			return false
+		end
+		FL_FLY.Enabled = true
+		FL_FLY._lastErr = nil
+
+		-- 限速调用：最多 ~30 次/秒，每步用累计 dt 算距离（速度因此与帧率无关）
+		local acc = 0
+		FL_FLY._conn = RunService.Heartbeat:Connect(function(dt)
+			if not FL_FLY.Enabled then return end
+			acc = acc + dt
+			if acc < 0.033 then return end
+			local step = acc
+			acc = 0
+			pcall(FL_FLY.Step, step)
+		end)
+
+		-- 重生 / 换角色：飞行状态作废，自动收干净（否则会留下 PlatformStand 和 mover）
+		if not FL_FLY._charConn then
+			FL_FLY._charConn = Players.LocalPlayer.CharacterAdded:Connect(function()
+				if FL_FLY.Enabled then FL_FLY.Stop() end
+			end)
+		end
+		return true
+	end
+
+	function FL_FLY.Status()
+		local _, hum, root = parts()
+		return {
+			Enabled  = FL_FLY.Enabled,
+			Speed    = FL_FLY.Speed,
+			VertSpeed= FL_FLY.VertSpeed,
+			UseCFrame= FL_FLY.UseCFrame,
+			HasChar  = root ~= nil,
+			PlatformStand = hum and hum.PlatformStand or false,
+			Movers   = FL_FLY._movers ~= nil,
+			LastErr  = FL_FLY._lastErr,
+		}
+	end
+end
+
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -596,6 +1182,11 @@ local _WINDOW = WindUI:CreateWindow({
 	ToggleKey = Enum.KeyCode.RightShift,
 })
 
+-- 版本标记：跑的是不是新文件，看这条通知就知道
+pcall(function()
+	_WINDOW:Notify({ Title = "CX", Content = "v3 已加载（无动画 · 引擎前置）", Duration = 6 })
+end)
+
 local EclipseUI = {}
 EclipseUI.__index = EclipseUI
 
@@ -659,592 +1250,6 @@ function EclipseUI:CreateWindow()
 		return _WINDOW:Notify({ Title = o.Title, Content = o.Content, Duration = o.Duration or 5 })
 	end
 	return w
-end
-
-
--- ==================================================================
---  CX 绕过层（元表 hook + Network 收口）
--- ==================================================================
-CX_META = CX_META or {}
-CX_META.Enabled = true
-CX_META.Dropped = 0
-CX_META.Blocked = {
-	fling = true, resetVelocity = true, spectatePlayer = true,
-	reconnectPlayer = true, resetCharacter = true,
-}
-CX_META.GuardSpeed = true
-CX_META.GuardVelocity = true
-CX_META.Network = nil
-CX_META._nc = nil
-CX_META._ni = nil
-
-local _A = {
-	getrawmetatable   = getrawmetatable,
-	setreadonly       = setreadonly,
-	getnamecallmethod = getnamecallmethod,
-	hookmetamethod    = hookmetamethod,
-}
-
-local function _drop(name)
-	if CX_META.Enabled and type(name) == "string" and CX_META.Blocked[name] then
-		CX_META.Dropped = CX_META.Dropped + 1
-		return true
-	end
-	return false
-end
-
-function CX_META.Install()
-	-- ① Network 收口（唯一能拿到真名的地方）
-	pcall(function()
-		local net = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared")
-			:WaitForChild("Core"):WaitForChild("Network"))
-		if type(net) == "table" then
-			CX_META.Network = net
-			local oldFire = net.FireServer
-			if type(oldFire) == "function" then
-				net.FireServer = function(name, ...)
-					if _drop(name) then return nil end
-					return oldFire(name, ...)
-				end
-			end
-			local oldInvoke = net.InvokeServer
-			if type(oldInvoke) == "function" then
-				net.InvokeServer = function(name, ...)
-					if _drop(name) then return nil end
-					return oldInvoke(name, ...)
-				end
-			end
-		end
-	end)
-
-	-- ② 元表 hook
-	local ok, mt = pcall(_A.getrawmetatable, game)
-	if not ok or type(mt) ~= "table" then return CX_META.Network ~= nil end
-	local oldNC = rawget(mt, "__namecall")
-	local oldNI = rawget(mt, "__newindex")
-	pcall(_A.setreadonly, mt, false)
-
-	if type(oldNC) == "function" and not CX_META._nc then
-		CX_META._nc = function(self, ...)
-			if CX_META.Enabled and _A.getnamecallmethod() == "FireServer" then
-				if _drop(select(1, ...)) then return nil end
-			end
-			return oldNC(self, ...)
-		end
-		pcall(function() mt.__namecall = CX_META._nc end)
-	end
-
-	if type(oldNI) == "function" and not CX_META._ni then
-		CX_META._ni = function(self, key, value)
-			if CX_META.Enabled then
-				local okI, isInst = pcall(function() return typeof(self) == "Instance" end)
-				if okI and isInst then
-					if CX_META.GuardSpeed and key == "WalkSpeed" then
-						local okH, isHum = pcall(function() return self:IsA("Humanoid") end)
-						if okH and isHum then return nil end
-					end
-					if CX_META.GuardVelocity and (key == "AssemblyLinearVelocity"
-						or key == "AssemblyAngularVelocity") then
-						local okP, isPart = pcall(function() return self:IsA("BasePart") end)
-						if okP and isPart then return nil end
-					end
-				end
-			end
-			return oldNI(self, key, value)
-		end
-		pcall(function() mt.__newindex = CX_META._ni end)
-	end
-
-	pcall(_A.setreadonly, mt, true)
-
-	-- ③ 老执行器退路
-	if not CX_META._nc and type(_A.hookmetamethod) == "function" then
-		pcall(function()
-			local old = _A.hookmetamethod(game, "__namecall", function(self, ...)
-				if _drop(select(1, ...)) then return nil end
-				return old(self, ...)
-			end)
-			CX_META._nc = true
-		end)
-	end
-
-	return true
-end
-
-pcall(CX_META.Install)
-
--- ===================================================================
---  弹道绘制（FL_TRACER）
---
---  视觉照搬 csgo 版那套「破空」三层 Beam（细亮芯 + 中层 + 外层柔光，
---  都朝目标端收窄），但**整体比 csgo 细一半**（Scale = 0.5）。
---
---  触发源：游戏每次开枪都会上报
---      PlayerEvent:FireServer("bullet", { pos = <命中点>, posDestroyX = <X>, weaponName = <枪名> })
---  （dump 782961 / 792485 / 801991 / 811930 / 821611 / 831283 —— 六条武器分支都会发）
---  FL_AC 的 __namecall 已经拦着 PlayerEvent，这里只是挂一个 FL_AC.OnBullet 回调，
---  **没开弹道绘制时那个分支直接短路，全局钩子零额外成本**。
---
---  起点：优先找枪械模型上的枪口（Barrel / Muzzle 附件），
---        找不到就退到相机位置（第一人称下就是眼睛，视觉上同样对）。
---
---  整层塞进全局表 FL_TRACER，不新增顶层 local。
--- ===================================================================
-do
-	local RunService = game:GetService("RunService")
-	local Players    = game:GetService("Players")
-	local LocalPlayer = Players.LocalPlayer
-
-	FL_TRACER = FL_TRACER or {}
-	FL_TRACER.Enabled = false
-	FL_TRACER.Hold    = 3        -- 停留（秒）
-	FL_TRACER.Drift   = 1.2      -- 飘散（秒）
-	FL_TRACER.Scale   = 0.5      -- 粗细系数（csgo 版是 1.0，这里细一半）
-	FL_TRACER.MaxLive = 40       -- 同时存在的弹道上限
-	FL_TRACER.Folder  = nil
-	FL_TRACER.Count   = 0
-
-	local MUZZLE_NAMES = { "Barrel", "Muzzle", "MuzzlePart", "MuzzleAttachment", "Tip" }
-
-	local function folder()
-		if FL_TRACER.Folder and FL_TRACER.Folder.Parent then
-			return FL_TRACER.Folder
-		end
-		local f = workspace:FindFirstChild("FL_Tracers")
-		if not f then
-			f = Instance.new("Folder")
-			f.Name = "FL_Tracers"
-			f.Parent = workspace
-		end
-		FL_TRACER.Folder = f
-		return f
-	end
-
-	-- 枪口：角色下带 Config 的武器模型 → 找 MUZZLE_NAMES 里的 BasePart 或 Attachment
-	local function muzzlePos()
-		local char = LocalPlayer.Character
-		if char then
-			for _, d in ipairs(char:GetDescendants()) do
-				if d:IsA("ModuleScript") and d.Name == "Config" and d.Parent then
-					for _, n in ipairs(MUZZLE_NAMES) do
-						local m = d.Parent:FindFirstChild(n, true)
-						if m then
-							if m:IsA("BasePart") then return m.Position end
-							if m:IsA("Attachment") then return m.WorldPosition end
-						end
-					end
-				end
-			end
-		end
-		local cam = workspace.CurrentCamera
-		if cam then return cam.CFrame.Position end
-		return nil
-	end
-
-	local function newPoint(parent, pos)
-		local part = Instance.new("Part")
-		part.Name = "TracerPoint"
-		part.Anchored = true
-		part.CanCollide = false
-		part.CanQuery   = false     -- 🔴 必须：否则弹道会挡住自己的子弹和射线
-		part.CanTouch   = false
-		part.CastShadow = false
-		part.Transparency = 1
-		part.Size = Vector3.new(0.05, 0.05, 0.05)
-		part.CFrame = CFrame.new(pos)
-		part.Parent = parent
-		local att = Instance.new("Attachment")
-		att.Name = "TracerAttach"
-		att.Parent = part
-		return part, att
-	end
-
-	-- 三层叠加做「破空」：都朝目标端收窄（Width1 < Width0）。
-	-- ⚠️ 数值 = csgo 版 × Scale（默认 0.5 → 细一半）。
-	local function newBeam(parent, a0, a1, w0, w1, transparency, emission)
-		local k = tonumber(FL_TRACER.Scale) or 0.5
-		local beam = Instance.new("Beam")
-		beam.Name = "TracerBeam"
-		beam.Attachment0 = a0
-		beam.Attachment1 = a1
-		beam.Width0 = w0 * k
-		beam.Width1 = w1 * k
-		beam.Segments = 1
-		beam.FaceCamera = true
-		beam.LightEmission = emission
-		beam.LightInfluence = 0      -- 不吃环境光 → 暗处也是纯白
-		beam.Color = ColorSequence.new(Color3.new(1, 1, 1))
-		beam.Transparency = NumberSequence.new(transparency)
-		beam.Parent = parent
-		return beam
-	end
-
-	local function spawnTracer(from, to)
-		if typeof(from) ~= "Vector3" or typeof(to) ~= "Vector3" then return end
-		if (to - from).Magnitude < 2 then return end
-		local f = folder()
-		if not f then return end
-
-		-- 并发上限：连射时不堆爆
-		local kids = f:GetChildren()
-		if #kids >= FL_TRACER.MaxLive then
-			for i = 1, #kids - FL_TRACER.MaxLive + 1 do
-				pcall(function() kids[i]:Destroy() end)
-			end
-		end
-
-		local holder = Instance.new("Folder")
-		holder.Name = "Tracer"
-		holder.Parent = f
-		FL_TRACER.Count = FL_TRACER.Count + 1
-
-		local p0, a0 = newPoint(holder, from)
-		local p1, a1 = newPoint(holder, to)
-
-		local core = newBeam(holder, a0, a1, 0.20, 0.06, 0.00, 1.00)
-		local mid  = newBeam(holder, a0, a1, 0.55, 0.20, 0.72, 0.80)
-		local halo = newBeam(holder, a0, a1, 1.30, 0.45, 0.88, 0.45)
-		local k = tonumber(FL_TRACER.Scale) or 0.5
-
-		task.spawn(function()
-			task.wait(math.max(0.1, tonumber(FL_TRACER.Hold) or 3))
-			if not holder.Parent then return end
-
-			local drift = math.max(0.1, tonumber(FL_TRACER.Drift) or 1.2)
-			local up = Vector3.new(0, 1, 0)
-			local t = 0
-			while t < drift do
-				local dt = RunService.Heartbeat:Wait()
-				if not holder.Parent then return end
-				t = t + dt
-				local e = math.clamp(t / drift, 0, 1)
-				e = e * e                    -- 越到后面散得越快
-				core.Transparency = NumberSequence.new(e)
-				mid.Transparency  = NumberSequence.new(0.72 + 0.28 * e)
-				halo.Transparency = NumberSequence.new(0.88 + 0.12 * e)
-				core.Width0 = 0.20 * k * (1 - 0.55 * e); core.Width1 = 0.06 * k * (1 - 0.55 * e)
-				mid.Width0  = 0.55 * k * (1 + 2.6 * e);  mid.Width1  = 0.20 * k * (1 + 2.6 * e)
-				halo.Width0 = 1.30 * k * (1 + 3.2 * e);  halo.Width1 = 0.45 * k * (1 + 3.2 * e)
-				local shift = up * (1.4 * e)
-				p0.CFrame = CFrame.new(from + shift)
-				p1.CFrame = CFrame.new(to + shift * 1.8)
-			end
-			holder:Destroy()
-		end)
-	end
-	FL_TRACER.Spawn = spawnTracer
-
-	-- FL_AC 的 __namecall 会在收到 "bullet" 上报时调这里
-	function FL_TRACER.OnBullet(payload)
-		if not FL_TRACER.Enabled then return end
-		if type(payload) ~= "table" then return end
-		local to = payload.pos
-		if typeof(to) ~= "Vector3" then return end
-		local from = muzzlePos()
-		if not from then return end
-		pcall(spawnTracer, from, to)
-	end
-
-	function FL_TRACER.Set(on)
-		FL_TRACER.Enabled = on and true or false
-		if FL_TRACER.Enabled then
-			folder()
-			if FL_AC then FL_AC.OnBullet = FL_TRACER.OnBullet end
-		else
-			if FL_AC then FL_AC.OnBullet = nil end
-			local f = FL_TRACER.Folder
-			if f then
-				for _, c in ipairs(f:GetChildren()) do
-					pcall(function() c:Destroy() end)
-				end
-			end
-		end
-		return FL_TRACER.Enabled
-	end
-
-	function FL_TRACER.Status()
-		return {
-			Enabled  = FL_TRACER.Enabled,
-			Hooked   = (FL_AC and FL_AC.OnBullet ~= nil) or false,
-			Scale    = FL_TRACER.Scale,
-			Hold     = FL_TRACER.Hold,
-			Drift    = FL_TRACER.Drift,
-			Live     = FL_TRACER.Folder and #FL_TRACER.Folder:GetChildren() or 0,
-			Count    = FL_TRACER.Count,
-		}
-	end
-end
-
--- ===================================================================
---  飞行（FL_FLY）
---  逻辑来源：用户提供的「飞行源码」
---    · 开：Humanoid 全部状态禁用 + PlatformStand + 冻结动画
---    · 在躯干上挂 BodyGyro（稳朝向）+ BodyVelocity（悬停）
---    · 用移动输入逐帧位移
---    · 关：全部还原 + 销毁两个 mover
---
---  ⚠️ 与源码的两处关键差异，都是为了不被反作弊抓：
---
---    ① 位移【不再】直接 chr:TranslateBy —— 那是一次赤裸的 CFrame 瞬移，
---       会喂给服务端的 charCheckpoint / charPivotTo 上报通道。
---       改成走 FL_AC.SafePivot（游戏自己的 charPivotTo 入口 +
---       ignoreServer=true + PivotBypass 重入标记），并且【限速调用】
---       （最多 ~30 次/秒，每步按累计 dt 算距离），不是每帧无脑瞬移。
---       FL_AC 不可用时才退回直接写 CFrame。
---
---    ② BodyGyro / BodyVelocity 正好在 FL_AC 那份「15 类物理移动器」名单里，
---       所以它们会被 StartSweep 每秒自动打上 UIATC 标记
---       → 在游戏眼里就是"它自己造的实例"。这一点不用额外做。
---
---  整层塞进全局表 FL_FLY，不新增顶层 local（Luau 每函数 ≤200 local 的约束）。
--- ===================================================================
-do
-	local UIS        = game:GetService("UserInputService")
-	local RunService = game:GetService("RunService")
-	local Players    = game:GetService("Players")
-
-	FL_FLY = FL_FLY or {}
-	FL_FLY.Enabled   = false
-	FL_FLY.Speed     = 40      -- 水平速度（studs/s）
-	FL_FLY.VertSpeed = 30      -- 垂直速度（studs/s）
-	-- true  = 直接写 CFrame / PivotTo（用户要的"cfram 逻辑"：最跟手、零依赖）
-	-- false = 走 FL_AC.SafePivot（游戏自己的 charPivotTo，会同步内部状态）
-	FL_FLY.UseCFrame = true
-	FL_FLY._conn     = nil
-	FL_FLY._movers   = nil
-	FL_FLY._charConn = nil
-	FL_FLY._lastErr  = nil
-
-	local STATES = {
-		Enum.HumanoidStateType.Climbing,
-		Enum.HumanoidStateType.FallingDown,
-		Enum.HumanoidStateType.Flying,
-		Enum.HumanoidStateType.Freefall,
-		Enum.HumanoidStateType.GettingUp,
-		Enum.HumanoidStateType.Jumping,
-		Enum.HumanoidStateType.Landed,
-		Enum.HumanoidStateType.Physics,
-		Enum.HumanoidStateType.PlatformStanding,
-		Enum.HumanoidStateType.Ragdoll,
-		Enum.HumanoidStateType.Running,
-		Enum.HumanoidStateType.RunningNoPhysics,
-		Enum.HumanoidStateType.Seated,
-		Enum.HumanoidStateType.StrafingNoPhysics,
-		Enum.HumanoidStateType.Swimming,
-	}
-
-	local function localChar()
-		local plr = Players.LocalPlayer
-		local c = plr and plr.Character
-		if not c or not c.Parent then return nil end
-		return c
-	end
-
-	local function parts()
-		local c = localChar()
-		if not c then return nil end
-		local hum = c:FindFirstChildWhichIsA("Humanoid")
-		local root = c:FindFirstChild("HumanoidRootPart") or c.PrimaryPart
-		-- R6 挂 Torso，R15 挂 UpperTorso；都没有就退到 root
-		local torso = c:FindFirstChild("UpperTorso") or c:FindFirstChild("Torso") or root
-		if not hum or not root or not torso then return nil end
-		return c, hum, root, torso
-	end
-
-	local function setStates(hum, enabled)
-		for _, st in ipairs(STATES) do
-			pcall(function() hum:SetStateEnabled(st, enabled) end)
-		end
-	end
-
-	local function freezeAnim(char, frozen)
-		local anim = char:FindFirstChild("Animate")
-		if anim then pcall(function() anim.Disabled = frozen end) end
-		pcall(function()
-			local h = char:FindFirstChildOfClass("Humanoid")
-				or char:FindFirstChildOfClass("AnimationController")
-			if not h then return end
-			for _, t in next, h:GetPlayingAnimationTracks() do
-				if frozen then
-					pcall(function() t:AdjustSpeed(0) end)
-				else
-					pcall(function() t:AdjustSpeed(1) end)
-				end
-			end
-		end)
-	end
-
-	-- 移动方向：优先读 WASD 自己算（不依赖 PlatformStand 下 MoveDirection 是否还更新），
-	-- 没有按键时退回 Humanoid.MoveDirection（手柄 / 摇杆）。
-	local function moveDir(hum)
-		local f, r = 0, 0
-		if UIS:IsKeyDown(Enum.KeyCode.W) then f = f + 1 end
-		if UIS:IsKeyDown(Enum.KeyCode.S) then f = f - 1 end
-		if UIS:IsKeyDown(Enum.KeyCode.D) then r = r + 1 end
-		if UIS:IsKeyDown(Enum.KeyCode.A) then r = r - 1 end
-		if f == 0 and r == 0 then
-			local md = hum.MoveDirection
-			if md and md.Magnitude > 0.01 then return md end
-			return Vector3.zero
-		end
-		local cam = workspace.CurrentCamera
-		if not cam then return Vector3.zero end
-		local lv = cam.CFrame.LookVector
-		local rv = cam.CFrame.RightVector
-		local fl = Vector3.new(lv.X, 0, lv.Z)
-		local fr = Vector3.new(rv.X, 0, rv.Z)
-		if fl.Magnitude < 1e-4 then fl = Vector3.new(0, 0, -1) end
-		if fr.Magnitude < 1e-4 then fr = Vector3.new(1, 0, 0) end
-		local v = fl.Unit * f + fr.Unit * r
-		if v.Magnitude < 1e-4 then return Vector3.zero end
-		return v.Unit * math.min(1, math.sqrt(f * f + r * r))
-	end
-
-	local function vertical()
-		local v = 0
-		if UIS:IsKeyDown(Enum.KeyCode.Space) then v = v + 1 end
-		if UIS:IsKeyDown(Enum.KeyCode.LeftControl)
-			or UIS:IsKeyDown(Enum.KeyCode.RightControl) then v = v - 1 end
-		return v
-	end
-
-	-- 位移。两种模式：
-	--   UseCFrame = true  → 直接写 CFrame（root + 整具 PivotTo），最跟手
-	--   UseCFrame = false → 走 FL_AC.SafePivot（游戏自己的入口，会同步内部状态）
-	local function moveTo(char, root, target)
-		if not FL_FLY.UseCFrame and FL_AC and type(FL_AC.SafePivot) == "function" then
-			local ok, done = pcall(FL_AC.SafePivot, target)
-			if ok and done then return true end
-		end
-		local cf = CFrame.new(target, target + (root.CFrame.LookVector or Vector3.new(0, 0, -1)))
-		local ok = pcall(function() root.CFrame = cf end)
-		if not ok then
-			ok = pcall(function() root.CFrame = CFrame.new(target) end)
-		end
-		-- 整具一起挪（避免部件之间被物理拉开）
-		pcall(function() char:PivotTo(cf) end)
-		return ok
-	end
-
-	function FL_FLY.Step(dt)
-		if not FL_FLY.Enabled then return end
-		local char, hum, root = parts()
-		if not char or not hum or not root then return end
-
-		local dir = moveDir(hum) * FL_FLY.Speed
-		local vy = vertical() * FL_FLY.VertSpeed
-		if vy ~= 0 then dir = dir + Vector3.new(0, vy, 0) end
-
-		local m = FL_FLY._movers
-		if dir.Magnitude < 0.01 then
-			-- 悬停：物理速度归零，别往下掉
-			if m and m.bv then pcall(function() m.bv.Velocity = Vector3.zero end) end
-			return
-		end
-
-		local target = root.Position + dir * dt
-		moveTo(char, root, target)
-
-		-- 位置完全由我们控制，别让 BodyVelocity 再推一次
-		if m and m.bv then pcall(function() m.bv.Velocity = Vector3.zero end) end
-		if m and m.bg then pcall(function() m.bg.CFrame = CFrame.new(target) end) end
-	end
-
-	function FL_FLY.Start()
-		local char, hum, _, torso = parts()
-		if not char or not hum then return false end
-
-		freezeAnim(char, true)
-		setStates(hum, false)
-		pcall(function() hum:ChangeState(Enum.HumanoidStateType.Swimming) end)
-		pcall(function() hum.PlatformStand = true end)
-
-		local bg = Instance.new("BodyGyro")
-		bg.Name = "FLFlyGyro"
-		bg.P = 9e4
-		bg.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
-		bg.CFrame = torso.CFrame
-		bg.Parent = torso
-
-		local bv = Instance.new("BodyVelocity")
-		bv.Name = "FLFlyVel"
-		bv.Velocity = Vector3.zero
-		bv.MaxForce = Vector3.new(9e9, 9e9, 9e9)
-		bv.Parent = torso
-
-		FL_FLY._movers = { bg = bg, bv = bv, torso = torso }
-		return true
-	end
-
-	function FL_FLY.Stop()
-		FL_FLY.Enabled = false
-		if FL_FLY._conn then
-			pcall(function() FL_FLY._conn:Disconnect() end)
-			FL_FLY._conn = nil
-		end
-		local m = FL_FLY._movers
-		if m then
-			pcall(function() if m.bg then m.bg:Destroy() end end)
-			pcall(function() if m.bv then m.bv:Destroy() end end)
-			FL_FLY._movers = nil
-		end
-		local char, hum = parts()
-		if char then
-			freezeAnim(char, false)
-			if hum then
-				setStates(hum, true)
-				pcall(function() hum:ChangeState(Enum.HumanoidStateType.RunningNoPhysics) end)
-				pcall(function() hum.PlatformStand = false end)
-			end
-		end
-	end
-
-	function FL_FLY.Set(on)
-		if not on then
-			FL_FLY.Stop()
-			return true
-		end
-		if FL_FLY.Enabled then return true end
-		if not FL_FLY.Start() then
-			FL_FLY._lastErr = "没有角色"
-			return false
-		end
-		FL_FLY.Enabled = true
-		FL_FLY._lastErr = nil
-
-		-- 限速调用：最多 ~30 次/秒，每步用累计 dt 算距离（速度因此与帧率无关）
-		local acc = 0
-		FL_FLY._conn = RunService.Heartbeat:Connect(function(dt)
-			if not FL_FLY.Enabled then return end
-			acc = acc + dt
-			if acc < 0.033 then return end
-			local step = acc
-			acc = 0
-			pcall(FL_FLY.Step, step)
-		end)
-
-		-- 重生 / 换角色：飞行状态作废，自动收干净（否则会留下 PlatformStand 和 mover）
-		if not FL_FLY._charConn then
-			FL_FLY._charConn = Players.LocalPlayer.CharacterAdded:Connect(function()
-				if FL_FLY.Enabled then FL_FLY.Stop() end
-			end)
-		end
-		return true
-	end
-
-	function FL_FLY.Status()
-		local _, hum, root = parts()
-		return {
-			Enabled  = FL_FLY.Enabled,
-			Speed    = FL_FLY.Speed,
-			VertSpeed= FL_FLY.VertSpeed,
-			UseCFrame= FL_FLY.UseCFrame,
-			HasChar  = root ~= nil,
-			PlatformStand = hum and hum.PlatformStand or false,
-			Movers   = FL_FLY._movers ~= nil,
-			LastErr  = FL_FLY._lastErr,
-		}
-	end
 end
 
 local espGui = getScreenGui("ESP")
