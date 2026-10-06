@@ -963,6 +963,7 @@ do
 	CX_FLY.Speed       = 40
 	CX_FLY.VertSpeed   = 30
 	CX_FLY.CameraFly   = true     -- ⭐ 跟视角：W/S 沿相机 LookVector（含上下）
+	CX_FLY.UsePlatformStand = false -- ⚠️ 开=各方向都能飞（物理不打架），但会复制给服务端（封号风险）
 	CX_FLY.FreezeAnim  = true     -- ⭐ 冻结动画（否则一直奔跑）
 	CX_FLY.Hover       = true     -- ⭐ 悬停（没输入时不掉）
 	CX_FLY.Pullbacks   = 0
@@ -1079,7 +1080,15 @@ do
 		-- 🔴 不再挂 BodyGyro / BodyVelocity（物理移动器 = 反作弊最爱扫的东西）
 		--    ⇒ 这两样是上一版被 ban 的直接原因，已彻底移除。
 		--    悬停改由"每帧写 CFrame 保持位置"实现（见 Step）。
-		pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false) end)
+		-- ⚠️ PlatformStand 能让"游戏物理不再跟你打架"（各方向都能飞、不被顶回来），
+		--    但它**会复制给服务端**（正常玩家不会 PlatformStand）⇒ 默认【关】。
+		--    你觉得"只能向前飞/有阻力"就是没开它的表现 —— 想飞得顺就打开，代价是更容易被查。
+		if CX_FLY.UsePlatformStand then
+			pcall(function()
+				hum.PlatformStand = true
+				hum:ChangeState(Enum.HumanoidStateType.Swimming)
+			end)
+		end
 		CX_FLY._movers = nil
 		return true
 	end
@@ -1122,7 +1131,8 @@ do
 		if char then
 			freezeAnim(char, false)
 			if hum then
-				pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true) end)
+				pcall(function() hum.PlatformStand = false end)
+				pcall(function() hum:ChangeState(Enum.HumanoidStateType.RunningNoPhysics) end)
 			end
 		end
 	end
@@ -3289,6 +3299,15 @@ pcall(function()
 	_WINDOW:Notify({ Title = "CX", Content = "v3 已加载（无动画 · 引擎前置）", Duration = 6 })
 end)
 
+-- ⭐ 真正的通知函数
+--   ⚠️ 参考脚本里的 `w(t)` 是 **task.wait(t)**，不是通知！之前误用它做提示 ⇒ 按钮"点击没反应"。
+function CX_TOAST(msg)
+	local text = tostring(msg)
+	pcall(function()
+		_WINDOW:Notify({ Title = "CX", Content = text, Duration = 8 })
+	end)
+end
+
 local EclipseUI = {}
 EclipseUI.__index = EclipseUI
 
@@ -3588,7 +3607,7 @@ playWelcome(function()
     s1:Toggle({ Name = "弹道绘制", Default = true,
         Callback = function(v) CX_RAGE.Tracer = v end })
     s1:Button({ Name = "自检：RageBot 状态", Callback = function()
-        w(CX_RAGE.Status())
+        CX_TOAST(CX_RAGE.Status())
     end })
 
     -- [改造] 自瞄已按用户要求移除
@@ -3621,7 +3640,7 @@ playWelcome(function()
                 ["Esp Box Color"]      = { Color = ESP.Theme.PurpleLight },
                 ["Esp Box Fill Color"] = { Color = ESP.Theme.PurpleMid },
             })
-            w("ESP 外观已复位")
+            CX_TOAST("ESP 外观已复位")
         end
     end })
 
@@ -3663,7 +3682,7 @@ playWelcome(function()
             end
         end
         if not best then
-            w("附近没找到带 objectId 的道具")
+            CX_TOAST("附近没找到带 objectId 的道具")
             return
         end
         local net = CX_META and CX_META.Network
@@ -3680,14 +3699,14 @@ playWelcome(function()
     s11:Toggle({ Name = "免密码（键盘弹出即成功）", Default = true,
         Callback = function(v) CX_CRACK.AutoKeypad = v end })
     s11:Button({ Name = "安装键盘 hook", Callback = function()
-        w(CX_CRACK.InstallKeypadHook() and "键盘 hook 已安装" or "安装失败（找不到 KeypadScreen）")
+        CX_TOAST(CX_CRACK.InstallKeypadHook() and "键盘 hook 已安装" or "安装失败（找不到 KeypadScreen）")
     end })
     s11:Button({ Name = "一键破解范围内所有容器", Callback = function()
         local n = CX_CRACK.RunAll()
         w(string.format("已对 %d 个容器发包", n))
     end })
     s11:Button({ Name = "自检：破解状态", Callback = function()
-        w(CX_CRACK.Status())
+        CX_TOAST(CX_CRACK.Status())
     end })
 
     -- ===================== 飞行（CX_FLY · 走平台通道）=====================
@@ -3702,6 +3721,8 @@ playWelcome(function()
         Callback = function(v) CX_FLY.Down = v end })
     s9:Toggle({ Name = "定身（悬浮不落地）", Default = true,
         Callback = function(v) CX_FLY.Anchor = v end })
+    s9:Toggle({ Name = "定身（PlatformStand）※封号风险", Default = false,
+        Callback = function(v) CX_FLY.UsePlatformStand = v end })
     s9:Toggle({ Name = "跟视角飞（W/S 沿相机朝向）", Default = true,
         Callback = function(v) CX_FLY.CameraFly = v end })
     s9:Toggle({ Name = "冻结动画（防一直奔跑）", Default = true,
@@ -3715,7 +3736,7 @@ playWelcome(function()
     s9:Slider({ Name = "找平台范围", Default = 250, Min = 20, Max = 2000,
         Callback = function(v) CX_FLY.PlatformRange = v end })
     s9:Button({ Name = "★ 自检：飞行状态（看被拉回次数）", Callback = function()
-        w(CX_FLY.Status())
+        CX_TOAST(CX_FLY.Status())
     end })
 
     -- ===================== 状态伪造（CX_STATE）=====================
@@ -3725,7 +3746,7 @@ playWelcome(function()
     s10:Toggle({ Name = "永远上报「冲刺中」", Default = false,
         Callback = function(on) CX_STATE.Pin.sprinting = on and true or false end })
     s10:Button({ Name = "查看见过的状态属性名", Callback = function()
-        w(CX_STATE.Report())
+        CX_TOAST(CX_STATE.Report())
     end })
 
     -- ===================== 载具飞行（CX_VFLY · 不限速）=====================
@@ -3746,7 +3767,7 @@ playWelcome(function()
     s12:Slider({ Name = "升力", Default = 250000, Min = 10000, Max = 3000000,
         Callback = function(v) CX_VFLY.Lift = v end })
     s12:Button({ Name = "自检：载具飞行状态", Callback = function()
-        w(CX_VFLY.Status())
+        CX_TOAST(CX_VFLY.Status())
     end })
 
     -- ===================== 枪械（CX_WPN）=====================
@@ -3764,10 +3785,10 @@ playWelcome(function()
             local Devv = require(game:GetService("ReplicatedStorage").Devv)
             t = Devv.load("ClientTools").GetLocalEquippedTool()
         end)
-        if t then CX_WPN.Fill(t) w("已补满") else w("手上没有武器") end
+        if t then CX_WPN.Fill(t) CX_TOAST("已补满") else CX_TOAST("手上没有武器") end
     end })
     s13:Button({ Name = "自检：枪械状态", Callback = function()
-        w(CX_WPN.Status())
+        CX_TOAST(CX_WPN.Status())
     end })
 
     -- ===================== 夜视（CX_NV）=====================
@@ -3775,7 +3796,7 @@ playWelcome(function()
     s14:Toggle({ Name = "夜视", Default = false,
         Callback = function(on) CX_NV.Set(on) end })
     s14:Button({ Name = "自检：夜视状态", Callback = function()
-        w(CX_NV.Status())
+        CX_TOAST(CX_NV.Status())
     end })
 
     -- ===================== 子弹追踪 / 强制命中（基于 RageBot 协议）=====================
@@ -3794,7 +3815,7 @@ playWelcome(function()
     s15:Toggle({ Name = "弹道绘制", Default = true,
         Callback = function(v) CX_RAGE.Tracer = v end })
     s15:Button({ Name = "自检：追踪状态", Callback = function()
-        w(CX_RAGE.Status())
+        CX_TOAST(CX_RAGE.Status())
     end })
 
     local s7 = Window:Tab({ Name = "关于" })
