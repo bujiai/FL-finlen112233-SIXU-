@@ -364,6 +364,7 @@ do
 	CX_RAGE.Interval   = 0.1      -- 每轮间隔
 	CX_RAGE.MaxTargets = 8        -- 一轮最多打几个（防刷爆 rateLimit）
 	CX_RAGE.Part       = "Head"   -- 瞄哪个部位
+	CX_RAGE.TrackMode  = "最近"   -- 追踪模式：最近 / 屏幕中心 / 准星方向
 	CX_RAGE.TeamCheck  = false    -- 不打同队
 	CX_RAGE.OnlyCombat = false    -- 只打"战斗模式"的人
 	CX_RAGE.Tracer     = true     -- 画弹道
@@ -523,6 +524,26 @@ do
 		if #targets == 0 then
 			CX_RAGE.LastErr = "范围内没有目标"
 			return
+		end
+		-- 追踪模式：按屏幕中心 / 准星方向重排
+		if CX_RAGE.TrackMode == "屏幕中心" or CX_RAGE.TrackMode == "准星方向" then
+			local cam = workspace.CurrentCamera
+			if cam then
+				local mid = cam.ViewportSize * 0.5
+				local scored = {}
+				for _, t in ipairs(targets) do
+					local sp, on = cam:WorldToViewportPoint(t.part.Position)
+					if on then
+						local d = CX_RAGE.TrackMode == "屏幕中心"
+							and (Vector2.new(sp.X, sp.Y) - mid).Magnitude
+							or (1 - cam.CFrame.LookVector:Dot((t.part.Position - cam.CFrame.Position).Unit))
+						scored[#scored + 1] = { t = t, s = d }
+					end
+				end
+				table.sort(scored, function(a, b) return a.s < b.s end)
+				targets = {}
+				for _, x in ipairs(scored) do targets[#targets + 1] = x.t end
+			end
 		end
 		local n = 0
 		for _, t in ipairs(targets) do
@@ -883,236 +904,248 @@ do
 end
 
 -- ==================================================================
---  飞行 v3（CX_FLY）—— 走【游戏自己的平台通道】，服务端认可
+--  飞行 v4（CX_FLY）—— 照 `fl_fly.lua`（FL 圣奥里）的做法重写
 --
---  ⭐⭐ 挖到底的结论（`ReplicatedStorage.Client.Wanted.Modules.ClientPlatforms`）：
---     这个游戏有"移动平台"系统 —— 平台 = CollectionService 标签 "Platform" 的部件。
---     客户端每帧（`stepPlatforms`）做三件事：
---        ① 射线找脚下最近的 Platform
---        ② Character:PivotTo(平台本帧位移 * Character.CFrame)          ← 本地移动角色
---        ③ 每 0.2s：FireServer("updatePlatformUnreliable", 平台, CompressCFrame(角色相对平台的偏移))
---           （离开平台时 FireServer("updatePlatform", nil)）
+--  🔴 上一版三个 bug（用户实测反馈）：
+--    ① **人直接到底** —— 没输入时我直接 `return`，没抵消重力 ⇒ 自由落体。
+--       fl_fly 的做法：**没输入时把 BodyVelocity 归零**（悬停），不掉。
+--    ② **人物动作一直奔跑** —— 没冻结动画。
+--       fl_fly 的做法：`Animate.Disabled = true` + 所有动画轨道 `AdjustSpeed(0)`。
+--    ③ **不跟视角** —— 我只用了水平方向。
+--       这版按"跟视角"做：**W/S 沿相机 LookVector（含上下）**，D/A 沿 RightVector，
+--       Space/Ctrl 纯升降。
 --
---     服务端把角色位置算成 **平台 CFrame × 上报的偏移** ⇒
---     **它信任客户端报的偏移** —— 而且这是游戏自己每秒 5 次都在发的包，完全不突兀。
---
---  ⇒ 所以：**先本地移动，再照游戏一模一样的方式上报偏移** = 服务端认可的位移。
---    这就是"别人能稳定飞"的原理：不是硬写 HRP（会被拉回），是**借用游戏自己的通道**。
---
---  ⚠️ 前提：附近要有 Platform 标签的部件（游戏里的移动平台 / 升降台）。
---     没有的话这条通道用不了，会退化成普通 CFrame 写（那就还是会被拉回）。
+--  ⭐ fl_fly 的完整套路（本版照搬）：
+--     Start: freezeAnim(true) + 禁用全部 Humanoid 状态 + ChangeState(Swimming)
+--            + PlatformStand = true + 挂 BodyGyro（稳朝向）+ BodyVelocity（悬停）
+--     Step : 算方向 → 写 CFrame（root + 整具 PivotTo）→ BodyVelocity 归零
+--            没输入 → BodyVelocity 归零 + return（悬停不掉）
+--     Stop : 还原动画/状态/PlatformStand + 销毁两个 mover
 -- ==================================================================
 do
-	local Players    = game:GetService("Players")
+	local Players = game:GetService("Players")
 	local RunService = game:GetService("RunService")
-	local UIS        = game:GetService("UserInputService")
-	local CollectionService = game:GetService("CollectionService")
-	local ReplicatedStorage = game:GetService("ReplicatedStorage")
+	local UIS = game:GetService("UserInputService")
 	local LocalPlayer = Players.LocalPlayer
-	local Camera      = workspace.CurrentCamera
 
 	CX_FLY = CX_FLY or {}
-	CX_FLY.Enabled       = false
-	CX_FLY.Speed         = 30       -- ⚠️ 降速：太快会被服务端拉回
-	CX_FLY.VertSpeed     = 22
-	CX_FLY.Anchor        = true     -- ⭐ 定身：PlatformStand + 禁用 Humanoid 状态（悬浮不落地）
-	CX_FLY.Adaptive      = true     -- ⭐ 被拉回就自动降速
-	CX_FLY.MinStep       = 0.4      -- 自适应下限
-	CX_FLY.Pullbacks     = 0        -- ⭐ 检测到"被拉回"的次数（这就是答案）
-	CX_FLY.Reports       = 0        -- 平台上报次数
-	CX_FLY._lastTarget   = nil
-	CX_FLY._lastReport   = 0
-	CX_FLY.MaxStep       = 8      -- 单帧位移上限
-	CX_FLY.ReportRate    = 0.2    -- 上报间隔（和游戏一致）
-	CX_FLY.PlatformRange = 250    -- 找平台的范围
-	CX_FLY.UsePlatform   = true   -- ⭐ 走平台通道（服务端认可）
-	CX_FLY.Up            = false  -- UI 上升（手机用）
-	CX_FLY.Down          = false  -- UI 下降（手机用）
-	CX_FLY.Platform      = nil
-	CX_FLY.Reports       = 0
-	CX_FLY.Steps         = 0
-	CX_FLY.LastErr       = nil
-	CX_FLY._conn         = nil
-	CX_FLY._lastReport   = 0
+	CX_FLY.Enabled     = false
+	CX_FLY.Speed       = 40
+	CX_FLY.VertSpeed   = 30
+	CX_FLY.CameraFly   = true     -- ⭐ 跟视角：W/S 沿相机 LookVector（含上下）
+	CX_FLY.FreezeAnim  = true     -- ⭐ 冻结动画（否则一直奔跑）
+	CX_FLY.Hover       = true     -- ⭐ 悬停（没输入时不掉）
+	CX_FLY.Pullbacks   = 0
+	CX_FLY.Steps       = 0
+	CX_FLY.LastErr     = nil
+	CX_FLY._conn       = nil
+	CX_FLY._movers     = nil
+	CX_FLY._lastTarget = nil
 
-	-- 拿游戏自己的 MathUtil（压缩 CFrame 用；拿不到就发原始 CFrame）
-	local MathUtil
-	pcall(function()
-		MathUtil = require(ReplicatedStorage.Devv).load("MathUtil")
-	end)
+	local STATES = {
+		Enum.HumanoidStateType.Climbing, Enum.HumanoidStateType.FallingDown,
+		Enum.HumanoidStateType.Flying, Enum.HumanoidStateType.Freefall,
+		Enum.HumanoidStateType.GettingUp, Enum.HumanoidStateType.Jumping,
+		Enum.HumanoidStateType.Landed, Enum.HumanoidStateType.Physics,
+		Enum.HumanoidStateType.PlatformStanding, Enum.HumanoidStateType.Ragdoll,
+		Enum.HumanoidStateType.Running, Enum.HumanoidStateType.RunningNoPhysics,
+		Enum.HumanoidStateType.Seated, Enum.HumanoidStateType.StrafingNoPhysics,
+		Enum.HumanoidStateType.Swimming,
+	}
 
-	local function key(k)
-		local ok, down = pcall(function() return UIS:IsKeyDown(k) end)
-		return ok and down
+	local function parts()
+		local c = LocalPlayer.Character
+		if not (c and c.Parent) then return nil end
+		local hum = c:FindFirstChildWhichIsA("Humanoid")
+		local root = c:FindFirstChild("HumanoidRootPart") or c.PrimaryPart
+		local torso = c:FindFirstChild("UpperTorso") or c:FindFirstChild("Torso") or root
+		if not (hum and root and torso) then return nil end
+		return c, hum, root, torso
 	end
 
-	-- ⭐ 方向读【游戏自己的 Humanoid.MoveDirection】——
-	--    那是游戏的控制模块算出来的，**手机摇杆 / 手柄 / 键盘全都写进它**，
-	--    所以这样写天然适配移动端，而且和游戏"一比一"（不是我们自己解析按键）。
-	local function moveDir(hrp)
-		local char = LocalPlayer.Character
-		local hum = char and char:FindFirstChildOfClass("Humanoid")
-		if not hum then return nil end
-		local md = hum.MoveDirection
-		if not md or md.Magnitude <= 0.01 then return nil end
-		-- MoveDirection 是相机空间的，转成世界方向（游戏也是这么用的）
-		local cf = Camera and Camera.CFrame
-		if not cf then return md end
-		local look = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z)
-		local right = Vector3.new(cf.RightVector.X, 0, cf.RightVector.Z)
-		if look.Magnitude < 1e-4 then look = Vector3.new(0, 0, -1) end
-		if right.Magnitude < 1e-4 then right = Vector3.new(1, 0, 0) end
-		look, right = look.Unit, right.Unit
-		return (look * -md.Z + right * md.X)
+	local function setStates(hum, enabled)
+		for _, st in ipairs(STATES) do
+			pcall(function() hum:SetStateEnabled(st, enabled) end)
+		end
 	end
 
-	-- 找附近带 "Platform" 标签的部件
-	function CX_FLY.FindPlatform()
-		local char = LocalPlayer.Character
-		local hrp = char and char:FindFirstChild("HumanoidRootPart")
-		if not hrp then return nil end
-		local best, bestD = nil, CX_FLY.PlatformRange
+	-- ⭐ 冻结动画（fl_fly 原样）
+	local function freezeAnim(char, frozen)
+		local anim = char:FindFirstChild("Animate")
+		if anim then pcall(function() anim.Disabled = frozen end) end
 		pcall(function()
-			for _, p in ipairs(CollectionService:GetTagged("Platform")) do
-				if p and p.Parent and p:IsA("BasePart") then
-					local d = (p.Position - hrp.Position).Magnitude
-					if d < bestD then best, bestD = p, d end
-				end
+			local h = char:FindFirstChildOfClass("Humanoid")
+				or char:FindFirstChildOfClass("AnimationController")
+			if not h then return end
+			for _, t in next, h:GetPlayingAnimationTracks() do
+				pcall(function() t:AdjustSpeed(frozen and 0 or 1) end)
 			end
 		end)
-		return best
+	end
+
+	-- 方向：跟视角（W/S 沿相机 LookVector 含上下；D/A 沿 RightVector），无键时退回 MoveDirection
+	local function moveDir(hum)
+		local f, r = 0, 0
+		local ok = pcall(function()
+			if UIS:IsKeyDown(Enum.KeyCode.W) then f = f + 1 end
+			if UIS:IsKeyDown(Enum.KeyCode.S) then f = f - 1 end
+			if UIS:IsKeyDown(Enum.KeyCode.D) then r = r + 1 end
+			if UIS:IsKeyDown(Enum.KeyCode.A) then r = r - 1 end
+		end)
+		if not ok then f, r = 0, 0 end
+		local cam = workspace.CurrentCamera
+		if f == 0 and r == 0 then
+			-- 手机/手柄：用游戏自己的 MoveDirection（相机空间的）
+			local md = hum.MoveDirection
+			if md and md.Magnitude > 0.01 and cam then
+				local lv = Vector3.new(cam.CFrame.LookVector.X, 0, cam.CFrame.LookVector.Z)
+				local rv = Vector3.new(cam.CFrame.RightVector.X, 0, cam.CFrame.RightVector.Z)
+				if lv.Magnitude < 1e-4 then lv = Vector3.new(0, 0, -1) end
+				if rv.Magnitude < 1e-4 then rv = Vector3.new(1, 0, 0) end
+				return lv.Unit * -md.Z + rv.Unit * md.X
+			end
+			return Vector3.zero
+		end
+		if not cam then return Vector3.zero end
+		local lv = cam.CFrame.LookVector
+		local rv = cam.CFrame.RightVector
+		if not CX_FLY.CameraFly then
+			lv = Vector3.new(lv.X, 0, lv.Z)
+			if lv.Magnitude < 1e-4 then lv = Vector3.new(0, 0, -1) end
+			lv = lv.Unit
+		end
+		rv = Vector3.new(rv.X, 0, rv.Z)
+		if rv.Magnitude < 1e-4 then rv = Vector3.new(1, 0, 0) end
+		local v = lv * f + rv.Unit * r
+		if v.Magnitude < 1e-4 then return Vector3.zero end
+		return v.Unit
+	end
+
+	local function vertical()
+		local v = 0
+		if CX_FLY.Up then v = v + 1 end
+		if CX_FLY.Down then v = v - 1 end
+		pcall(function()
+			if UIS:IsKeyDown(Enum.KeyCode.Space) then v = v + 1 end
+			if UIS:IsKeyDown(Enum.KeyCode.LeftControl) or UIS:IsKeyDown(Enum.KeyCode.RightControl) then
+				v = v - 1
+			end
+		end)
+		return v
+	end
+
+	local function moveTo(char, root, target)
+		local cf = CFrame.new(target, target + root.CFrame.LookVector)
+		local ok = pcall(function() root.CFrame = cf end)
+		pcall(function() char:PivotTo(cf) end)
+		return ok
+	end
+
+	function CX_FLY.Start()
+		local char, hum, _, torso = parts()
+		if not char or not hum then return false end
+		if CX_FLY.FreezeAnim then freezeAnim(char, true) end
+		setStates(hum, false)
+		pcall(function() hum:ChangeState(Enum.HumanoidStateType.Swimming) end)
+		pcall(function() hum.PlatformStand = true end)
+
+		local bg = Instance.new("BodyGyro")
+		bg.Name = "CXFlyGyro"
+		bg.P = 9e4
+		bg.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+		bg.CFrame = torso.CFrame
+		bg.Parent = torso
+
+		local bv = Instance.new("BodyVelocity")
+		bv.Name = "CXFlyVel"
+		bv.Velocity = Vector3.zero
+		bv.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+		bv.Parent = torso
+
+		CX_FLY._movers = { bg = bg, bv = bv, torso = torso }
+		return true
 	end
 
 	function CX_FLY.Step(dt)
-		dt = tonumber(dt) or (1 / 60)
-		local char = LocalPlayer.Character
-		if not char then CX_FLY.LastErr = "没有角色" return end
-		local hrp = char:FindFirstChild("HumanoidRootPart")
-		if not hrp then CX_FLY.LastErr = "没有 HRP" return end
+		if not CX_FLY.Enabled then return end
+		local char, hum, root = parts()
+		if not char or not hum or not root then return end
 
-		-- ⭐ 被拉回检测：上一帧我们写到哪儿，这一帧还在不在那儿
+		-- 被拉回检测
 		if CX_FLY._lastTarget then
-			local drift = (hrp.Position - CX_FLY._lastTarget).Magnitude
-			-- 我们自己这一帧还没动，正常漂移应该很小（重力/摩擦）
-			if drift > math.max(3, CX_FLY.MaxStep) then
+			local drift = (root.Position - CX_FLY._lastTarget).Magnitude
+			if drift > math.max(6, CX_FLY.Speed * dt * 4) then
 				CX_FLY.Pullbacks = CX_FLY.Pullbacks + 1
-				if CX_FLY.Adaptive then
-					CX_FLY.MaxStep = math.max(CX_FLY.MinStep, CX_FLY.MaxStep * 0.8)
-				end
 			end
 		end
 
-		local dir = moveDir(hrp)
-		local vertical = 0
-		-- 上升/下降：优先 UI 开关（手机可用），键盘 Space/Ctrl 作为补充
-		if CX_FLY.Up then vertical = vertical + 1 end
-		if CX_FLY.Down then vertical = vertical - 1 end
-		if key(Enum.KeyCode.Space) then vertical = vertical + 1 end
-		if key(Enum.KeyCode.LeftControl) or key(Enum.KeyCode.LeftShift) then vertical = vertical - 1 end
+		local m = CX_FLY._movers
+		local dir = moveDir(hum) * CX_FLY.Speed
+		local vy = vertical() * CX_FLY.VertSpeed
+		if vy ~= 0 then dir = dir + Vector3.new(0, vy, 0) end
 
-		local step = Vector3.new(0, 0, 0)
-		if dir and dir.Magnitude > 0 then
-			step = step + dir.Unit * (CX_FLY.Speed * dt)
+		-- ⭐ 悬停：没输入就把物理速度归零 —— 这是"不掉下去"的关键
+		if dir.Magnitude < 0.01 then
+			if m and m.bv then pcall(function() m.bv.Velocity = Vector3.zero end) end
+			CX_FLY._lastTarget = root.Position
+			return
 		end
-		step = step + Vector3.new(0, vertical * (CX_FLY.VertSpeed * dt), 0)
-		if step.Magnitude > CX_FLY.MaxStep then
-			step = step.Unit * CX_FLY.MaxStep
-		end
-		if step.Magnitude <= 1e-6 then return end
 
-		-- ① 本地移动（保留朝向，和游戏一样）
-		local ok = pcall(function() hrp.CFrame = hrp.CFrame + step end)
-		if not ok then CX_FLY.LastErr = "写 CFrame 失败" return end
+		local target = root.Position + dir * dt
+		moveTo(char, root, target)
+		if m and m.bv then pcall(function() m.bv.Velocity = Vector3.zero end) end
+		if m and m.bg then pcall(function() m.bg.CFrame = CFrame.new(target) end) end
 		CX_FLY.Steps = CX_FLY.Steps + 1
-		CX_FLY._lastTarget = hrp.Position
-
-		-- ② 照游戏的方式上报偏移（服务端据此认下这个位置）
-		if not CX_FLY.UsePlatform then return end
-		local plat = CX_FLY.Platform
-		if not (plat and plat.Parent) then
-			plat = CX_FLY.FindPlatform()
-			CX_FLY.Platform = plat
-		end
-		if not plat then
-			CX_FLY.LastErr = "附近没有 Platform 标签的部件（这条通道用不了）"
-			return
-		end
-
-		local now = os.clock()
-		if now - CX_FLY._lastReport < CX_FLY.ReportRate then return end
-		CX_FLY._lastReport = now
-
-		local net = CX_META and CX_META.Network
-		if not (net and type(net.FireServer) == "function") then
-			CX_FLY.LastErr = "Network 未挂上"
-			return
-		end
-
-		local offset = plat:GetPivot():ToObjectSpace(hrp.CFrame)
-		local payload = offset
-		if MathUtil and type(MathUtil.CompressCFrame) == "function" then
-			local okc, c = pcall(MathUtil.CompressCFrame, offset)
-			if okc and c then payload = c end
-		end
-		net.FireServer("updatePlatformUnreliable", plat, payload)
-		CX_FLY.Reports = CX_FLY.Reports + 1
+		CX_FLY._lastTarget = root.Position
 		CX_FLY.LastErr = nil
 	end
 
-	function CX_FLY.Set(on)
-		CX_FLY.Enabled = on and true or false
+	function CX_FLY.Stop()
+		CX_FLY.Enabled = false
 		if CX_FLY._conn then
-			CX_FLY._conn:Disconnect()
+			pcall(function() CX_FLY._conn:Disconnect() end)
 			CX_FLY._conn = nil
 		end
-		if not CX_FLY.Enabled then
-			-- 还原定身
-			if CX_FLY.Anchor then
-				pcall(function()
-					local char = LocalPlayer.Character
-					local hum = char and char:FindFirstChildOfClass("Humanoid")
-					if hum then
-						hum.PlatformStand = false
-						hum:ChangeState(Enum.HumanoidStateType.Running)
-					end
-				end)
+		local m = CX_FLY._movers
+		if m then
+			pcall(function() if m.bg then m.bg:Destroy() end end)
+			pcall(function() if m.bv then m.bv:Destroy() end end)
+			CX_FLY._movers = nil
+		end
+		local char, hum = parts()
+		if char then
+			freezeAnim(char, false)
+			if hum then
+				setStates(hum, true)
+				pcall(function() hum:ChangeState(Enum.HumanoidStateType.RunningNoPhysics) end)
+				pcall(function() hum.PlatformStand = false end)
 			end
-			-- 退出时照游戏的做法清一次
-			pcall(function()
-				local net = CX_META and CX_META.Network
-				if net and type(net.FireServer) == "function" then
-					net.FireServer("updatePlatform", nil)
-				end
-			end)
-			CX_FLY.Platform = nil
-			return
 		end
-		-- ⭐ 定身：PlatformStand 让角色悬浮（不落地、不受重力影响）
-		if CX_FLY.Anchor then
-			pcall(function()
-				local char = LocalPlayer.Character
-				local hum = char and char:FindFirstChildOfClass("Humanoid")
-				if hum then
-					hum.PlatformStand = true
-					hum:ChangeState(Enum.HumanoidStateType.Physics)
-				end
-			end)
+	end
+
+	function CX_FLY.Set(on)
+		if not on then CX_FLY.Stop() return true end
+		if CX_FLY.Enabled then return true end
+		if not CX_FLY.Start() then
+			CX_FLY.LastErr = "没有角色"
+			return false
 		end
+		CX_FLY.Enabled = true
+		CX_FLY.LastErr = nil
 		CX_FLY._conn = RunService.RenderStepped:Connect(function(dt)
-			if CX_FLY.Enabled then
-				pcall(CX_FLY.Step, dt)
-			end
+			if CX_FLY.Enabled then pcall(CX_FLY.Step, dt) end
 		end)
+		return true
 	end
 
 	function CX_FLY.Status()
-		return string.format("飞行=%s 定身=%s 平台通道=%s 平台=%s\n位移=%d 上报=%d ★被拉回=%d 当前单帧上限=%.2f\n%s",
-			tostring(CX_FLY.Enabled), tostring(CX_FLY.Anchor), tostring(CX_FLY.UsePlatform),
-			tostring(CX_FLY.Platform and CX_FLY.Platform.Name or "无"),
-			CX_FLY.Steps, CX_FLY.Reports, CX_FLY.Pullbacks, CX_FLY.MaxStep,
+		return string.format("飞行=%s 跟视角=%s 冻结动画=%s 悬停=%s\\n位移=%d ★被拉回=%d | %s",
+			tostring(CX_FLY.Enabled), tostring(CX_FLY.CameraFly), tostring(CX_FLY.FreezeAnim),
+			tostring(CX_FLY.Hover), CX_FLY.Steps, CX_FLY.Pullbacks,
 			tostring(CX_FLY.LastErr or "ok"))
 	end
 end
+
 
 -- ==================================================================
 --  载具飞行（CX_VFLY）—— ⭐ 不限速
@@ -3112,6 +3145,12 @@ if ESP then
 	end
 
 	ESP.WeaponResolver = nil
+	ESP.Enabled = false        -- 默认关，等 UI 打开
+
+	-- ⭐⭐ 必须调 Init()！绘制库【不会自动初始化】，不调就没有 Overlay ⇒ 屏幕上一个都画不出来
+	pcall(function()
+		ESP.Init()
+	end)
 
 	-- ⭐ 外观复位：保证默认就是"绘制库原版"（紫色完整方框 + 紫色填充）
 	task.spawn(function()
@@ -3126,6 +3165,65 @@ if ESP then
 	end)
 end
 -- ===================== CX 适配层结束 =====================
+
+
+-- ==================================================================
+--  夜视（CX_NV）—— 绿色提亮 + ColorCorrection
+-- ==================================================================
+do
+	CX_NV = CX_NV or {}
+	CX_NV.Enabled = false
+	CX_NV._orig = nil
+
+	function CX_NV.Set(on)
+		local L = game:GetService("Lighting")
+		CX_NV.Enabled = on and true or false
+		if not CX_NV._orig then
+			CX_NV._orig = {
+				Brightness = L.Brightness, Ambient = L.Ambient,
+				OutdoorAmbient = L.OutdoorAmbient, ClockTime = L.ClockTime,
+				FogEnd = L.FogEnd, GlobalShadows = L.GlobalShadows,
+			}
+		end
+		if on then
+			pcall(function()
+				L.Brightness = 3
+				L.Ambient = Color3.fromRGB(90, 200, 90)
+				L.OutdoorAmbient = Color3.fromRGB(90, 200, 90)
+				L.ClockTime = 14
+				L.FogEnd = 1000000
+				L.GlobalShadows = false
+			end)
+			local cc = L:FindFirstChild("CX_NightVision")
+			if not cc then
+				cc = Instance.new("ColorCorrectionEffect")
+				cc.Name = "CX_NightVision"
+				cc.Parent = L
+			end
+			pcall(function()
+				cc.TintColor = Color3.fromRGB(120, 255, 120)
+				cc.Brightness = 0.15
+				cc.Contrast = 0.15
+			end)
+		else
+			local o = CX_NV._orig
+			pcall(function()
+				L.Brightness = o.Brightness
+				L.Ambient = o.Ambient
+				L.OutdoorAmbient = o.OutdoorAmbient
+				L.ClockTime = o.ClockTime
+				L.FogEnd = o.FogEnd
+				L.GlobalShadows = o.GlobalShadows
+			end)
+			local cc = L:FindFirstChild("CX_NightVision")
+			if cc then pcall(function() cc:Destroy() end) end
+		end
+	end
+
+	function CX_NV.Status()
+		return "夜视=" .. tostring(CX_NV.Enabled)
+	end
+end
 
 -- ==================================================================
 --  WindUI 适配层
@@ -3484,13 +3582,8 @@ playWelcome(function()
         w(CX_RAGE.Status())
     end })
 
-    local s2 = Window:Tab({ Name = "Aimbot" })
-    s2:Toggle({Name = "自瞄", Default = false, Callback = function(s) CFG.aimbot = s end})
-    s2:Toggle({Name = "FOV圈", Default = true, Callback = function(s) CFG.showAimCircle = s end})
-    s2:Toggle({Name = "标名", Default = true, Callback = function(s) CFG.showTargetName = s end})
-    s2:Slider({Name = "FOV", Default = 150, Min = 10, Max = 500, Callback = function(v) CFG.aimbotFOV = v end})
+    -- [改造] 自瞄已按用户要求移除
 
-    -- [改造] 空壳父页签「视觉」已删（功能拆成独立页签）
     -- ===================== ESP（通用绘制库）=====================
     --  ⭐ 样式就是绘制库原版：完整方框 PurpleLight(210,180,255) + 框内 PurpleMid(170,120,255) 填充
     local s3 = Window:Tab({ Name = "ESP", Icon = "eye" })
@@ -3595,8 +3688,10 @@ playWelcome(function()
         Callback = function(v) CX_FLY.Down = v end })
     s9:Toggle({ Name = "定身（悬浮不落地）", Default = true,
         Callback = function(v) CX_FLY.Anchor = v end })
-    s9:Toggle({ Name = "被拉回自动降速", Default = true,
-        Callback = function(v) CX_FLY.Adaptive = v end })
+    s9:Toggle({ Name = "跟视角飞（W/S 沿相机朝向）", Default = true,
+        Callback = function(v) CX_FLY.CameraFly = v end })
+    s9:Toggle({ Name = "冻结动画（防一直奔跑）", Default = true,
+        Callback = function(v) CX_FLY.FreezeAnim = v end })
     s9:Slider({ Name = "飞行速度", Default = 30, Min = 5, Max = 300,
         Callback = function(v) CX_FLY.Speed = v end })
     s9:Slider({ Name = "飞行升降速度", Default = 22, Min = 5, Max = 200,
@@ -3659,6 +3754,33 @@ playWelcome(function()
     end })
     s13:Button({ Name = "自检：枪械状态", Callback = function()
         w(CX_WPN.Status())
+    end })
+
+    -- ===================== 夜视（CX_NV）=====================
+    local s14 = Window:Tab({ Name = "夜视", Icon = "moon" })
+    s14:Toggle({ Name = "夜视", Default = false,
+        Callback = function(on) CX_NV.Set(on) end })
+    s14:Button({ Name = "自检：夜视状态", Callback = function()
+        w(CX_NV.Status())
+    end })
+
+    -- ===================== 子弹追踪 / 强制命中（基于 RageBot 协议）=====================
+    local s15 = Window:Tab({ Name = "子弹追踪", Icon = "crosshair" })
+    s15:Paragraph({ Name = "说明", Desc = "走 RageBot 同一套协议（shoot + registerProjectileHits 伪造命中），所以不受弹药/射速/射程限制。" })
+    s15:Toggle({ Name = "启用强制命中", Default = false,
+        Callback = function(on) CX_RAGE.Set(on) end })
+    s15:Dropdown({ Name = "追踪目标", Default = "最近", Values = { "最近", "屏幕中心", "准星方向" },
+        Callback = function(v) CX_RAGE.TrackMode = v end })
+    s15:Slider({ Name = "追踪范围", Default = 300, Min = 20, Max = 2000,
+        Callback = function(v) CX_RAGE.Range = v end })
+    s15:Slider({ Name = "追踪间隔（×0.01 秒）", Default = 10, Min = 3, Max = 100,
+        Callback = function(v) CX_RAGE.Interval = math.max(0.03, v / 100) end })
+    s15:Dropdown({ Name = "命中部位", Default = "Head", Values = { "Head", "HumanoidRootPart", "UpperTorso", "Torso" },
+        Callback = function(v) CX_RAGE.Part = v end })
+    s15:Toggle({ Name = "弹道绘制", Default = true,
+        Callback = function(v) CX_RAGE.Tracer = v end })
+    s15:Button({ Name = "自检：追踪状态", Callback = function()
+        w(CX_RAGE.Status())
     end })
 
     local s7 = Window:Tab({ Name = "关于" })
