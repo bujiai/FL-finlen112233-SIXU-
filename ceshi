@@ -5,6 +5,7 @@
 CX_META = CX_META or {}
 CX_META.Enabled = true
 CX_META.Silent = true          -- 静默：不弹任何通知
+CX_META.UseMetaHooks = false   -- ⚠️ 默认【不挂】元表 hook（改 game 元表最容易被查）
 CX_META.Dropped = 0
 CX_META.Blocked = {
 	fling = true, resetVelocity = true, spectatePlayer = true,
@@ -55,7 +56,8 @@ function CX_META.Install()
 		end
 	end)
 
-	-- ② 元表 hook
+	-- ② 元表 hook（默认关：改 game 元表最容易被反作弊查到）
+	if not CX_META.UseMetaHooks then return CX_META.Network ~= nil end
 	local ok, mt = pcall(_A.getrawmetatable, game)
 	if not ok or type(mt) ~= "table" then return CX_META.Network ~= nil end
 	local oldNC = rawget(mt, "__namecall")
@@ -134,7 +136,7 @@ pcall(CX_META.Install)
 --     这不改位置，只是让服务端"允许"的速度上限更高，从而**减少被拉回**。
 -- ==================================================================
 CX_STATE = CX_STATE or {}
-CX_STATE.Enabled = true          -- 静默默认开
+CX_STATE.Enabled = false         -- ⚠️ 默认【关】：伪造状态会被服务端交叉比对，封号高危
 CX_STATE.ForceSprint = true      -- 永远上报"正在冲刺"
 CX_STATE.Log = {}                -- 见过哪些 playerState 属性名
 CX_STATE.Forged = 0
@@ -563,6 +565,8 @@ do
 	CX_FLY.ReportRate    = 0.2    -- 上报间隔（和游戏一致）
 	CX_FLY.PlatformRange = 250    -- 找平台的范围
 	CX_FLY.UsePlatform   = true   -- ⭐ 走平台通道（服务端认可）
+	CX_FLY.Up            = false  -- UI 上升（手机用）
+	CX_FLY.Down          = false  -- UI 下降（手机用）
 	CX_FLY.Platform      = nil
 	CX_FLY.Reports       = 0
 	CX_FLY.Steps         = 0
@@ -581,20 +585,24 @@ do
 		return ok and down
 	end
 
-	local function moveDir()
+	-- ⭐ 方向读【游戏自己的 Humanoid.MoveDirection】——
+	--    那是游戏的控制模块算出来的，**手机摇杆 / 手柄 / 键盘全都写进它**，
+	--    所以这样写天然适配移动端，而且和游戏"一比一"（不是我们自己解析按键）。
+	local function moveDir(hrp)
+		local char = LocalPlayer.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if not hum then return nil end
+		local md = hum.MoveDirection
+		if not md or md.Magnitude <= 0.01 then return nil end
+		-- MoveDirection 是相机空间的，转成世界方向（游戏也是这么用的）
 		local cf = Camera and Camera.CFrame
-		if not cf then return nil end
-		local look, right = cf.LookVector, cf.RightVector
-		local fwd = Vector3.new(look.X, 0, look.Z)
-		fwd = fwd.Magnitude > 1e-4 and fwd.Unit or Vector3.new(0, 0, -1)
-		local rt = Vector3.new(right.X, 0, right.Z)
-		rt = rt.Magnitude > 1e-4 and rt.Unit or Vector3.new(1, 0, 0)
-		local d = Vector3.new(0, 0, 0)
-		if key(Enum.KeyCode.W) then d = d + fwd end
-		if key(Enum.KeyCode.S) then d = d - fwd end
-		if key(Enum.KeyCode.D) then d = d + rt end
-		if key(Enum.KeyCode.A) then d = d - rt end
-		return d
+		if not cf then return md end
+		local look = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z)
+		local right = Vector3.new(cf.RightVector.X, 0, cf.RightVector.Z)
+		if look.Magnitude < 1e-4 then look = Vector3.new(0, 0, -1) end
+		if right.Magnitude < 1e-4 then right = Vector3.new(1, 0, 0) end
+		look, right = look.Unit, right.Unit
+		return (look * -md.Z + right * md.X)
 	end
 
 	-- 找附近带 "Platform" 标签的部件
@@ -621,8 +629,11 @@ do
 		local hrp = char:FindFirstChild("HumanoidRootPart")
 		if not hrp then CX_FLY.LastErr = "没有 HRP" return end
 
-		local dir = moveDir()
+		local dir = moveDir(hrp)
 		local vertical = 0
+		-- 上升/下降：优先 UI 开关（手机可用），键盘 Space/Ctrl 作为补充
+		if CX_FLY.Up then vertical = vertical + 1 end
+		if CX_FLY.Down then vertical = vertical - 1 end
 		if key(Enum.KeyCode.Space) then vertical = vertical + 1 end
 		if key(Enum.KeyCode.LeftControl) or key(Enum.KeyCode.LeftShift) then vertical = vertical - 1 end
 
@@ -699,7 +710,7 @@ do
 	end
 
 	function CX_FLY.Status()
-		return string.format("飞行=%s 平台通道=%s 平台=%s | 位移=%d 上报=%d | %s",
+		return string.format("飞行=%s 平台通道=%s 平台=%s | 位移=%d 上报=%d\n方向读 Humanoid.MoveDirection（手机/手柄/键盘通用） | %s",
 			tostring(CX_FLY.Enabled), tostring(CX_FLY.UsePlatform),
 			tostring(CX_FLY.Platform and CX_FLY.Platform.Name or "无"),
 			CX_FLY.Steps, CX_FLY.Reports, tostring(CX_FLY.LastErr or "ok"))
@@ -1610,34 +1621,27 @@ playWelcome(function()
     local s4 = tabSettings:Section("目标")
     s4:Input({Name = "部位", Default = "Head", Placeholder = "Head/Torso", Callback = function(v) CFG.targetPart = v end})
 
-    local s6 = tabSettings:Section("心跳伪造")
-    s6:Toggle({Name = "心跳伪造", Default = false, Callback = function(s) CFG.heartbeatForge = s end})
-
+    -- [改造] 「心跳伪造」已移除（原实现改 game 元表，CX 里本来也没生效）
 
     -- ===================== 远程交互（propInteraction）=====================
     local s8 = tabSettings:Section("远程交互")
-    local propRadius = 80
-    local propAction = "toggle"
-
-    s8:Slider({ Name = "扫描半径", Default = 80, Min = 5, Max = 500,
-        Callback = function(v) propRadius = v end })
-
-    s8:Dropdown({ Name = "动作", Default = "toggle",
+    s8:Slider({ Name = "道具扫描半径", Default = 80, Min = 5, Max = 500,
+        Callback = function(v) CX_PROP_RADIUS = v end })
+    s8:Dropdown({ Name = "交互动作", Default = "toggle",
         Values = { "toggle", "lock", "knock", "hack", "takeLoot", "loot", "openLuggage",
                    "toggleRamp", "swipeKeycard", "takeBrick", "setOpen", "dismantle",
                    "unjam", "placeDrill", "ring", "fix", "call", "spin" },
-        Callback = function(v) propAction = v end })
-
-    local function findNearestProp()
+        Callback = function(v) CX_PROP_ACTION = v end })
+    s8:Button({ Name = "对最近的道具发交互", Callback = function()
         local char = LocalPlayer.Character
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
-        if not hrp then return nil end
-        local root = Workspace:FindFirstChild("Local")
-        if not root then return nil end
-        local best, bestD, seen = nil, propRadius, 0
+        if not hrp then return end
+        local root = workspace:FindFirstChild("Local")
+        if not root then return end
+        local radius = tonumber(CX_PROP_RADIUS) or 80
+        local action = CX_PROP_ACTION or "toggle"
+        local best, bestD = nil, radius
         for _, d in ipairs(root:GetDescendants()) do
-            seen = seen + 1
-            if seen > 40000 then break end
             local ok, id = pcall(function() return d:GetAttribute("objectId") end)
             if ok and type(id) == "string" then
                 local ok2, pos = pcall(function()
@@ -1651,19 +1655,28 @@ playWelcome(function()
                 end
             end
         end
-        return best, bestD
-    end
-
-    s8:Button({ Name = "对最近的道具发交互", Callback = function()
-        local id, dist = findNearestProp()
-        if not id then
+        if not best then
             w("附近没找到带 objectId 的道具")
             return
         end
-        fireServer("propInteraction", id, propAction)
-        w(string.format("已发 propInteraction(%s, %s)  距离 %.1f", id, propAction, dist or -1))
+        local net = CX_META and CX_META.Network
+        if net and net.FireServer then
+            net.FireServer("propInteraction", best, action)
+            w(string.format("已发 propInteraction(%s, %s)  距离 %.1f", best, action, bestD))
+        end
     end })
 
+    -- ===================== 保险箱 / 容器破解（CX_CRACK）=====================
+    local s11 = tabSettings:Section("保险箱破解")
+    s11:Slider({ Name = "破解扫描半径", Default = 60, Min = 10, Max = 1000,
+        Callback = function(v) CX_CRACK.Radius = v end })
+    s11:Button({ Name = "一键破解范围内所有容器", Callback = function()
+        local n = CX_CRACK.RunAll()
+        w(string.format("已对 %d 个容器发包", n))
+    end })
+    s11:Button({ Name = "自检：破解状态", Callback = function()
+        w(CX_CRACK.Status())
+    end })
 
     -- ===================== 飞行（CX_FLY · 走平台通道）=====================
     local s9 = tabSettings:Section("飞行")
@@ -1671,6 +1684,10 @@ playWelcome(function()
         Callback = function(on) CX_FLY.Set(on) end })
     s9:Toggle({ Name = "走平台通道（服务端认可）", Default = true,
         Callback = function(v) CX_FLY.UsePlatform = v end })
+    s9:Toggle({ Name = "上升（手机点这个）", Default = false,
+        Callback = function(v) CX_FLY.Up = v end })
+    s9:Toggle({ Name = "下降（手机点这个）", Default = false,
+        Callback = function(v) CX_FLY.Down = v end })
     s9:Slider({ Name = "飞行速度", Default = 60, Min = 5, Max = 300,
         Callback = function(v) CX_FLY.Speed = v end })
     s9:Slider({ Name = "飞行升降速度", Default = 40, Min = 5, Max = 200,
@@ -1681,6 +1698,16 @@ playWelcome(function()
         Callback = function(v) CX_FLY.PlatformRange = v end })
     s9:Button({ Name = "自检：飞行状态", Callback = function()
         w(CX_FLY.Status())
+    end })
+
+    -- ===================== 状态伪造（CX_STATE）=====================
+    local s10 = tabSettings:Section("状态伪造")
+    s10:Toggle({ Name = "伪造玩家状态（钉住最快档）", Default = false,
+        Callback = function(on) CX_STATE.Enabled = on end })
+    s10:Toggle({ Name = "永远上报「冲刺中」", Default = false,
+        Callback = function(on) CX_STATE.Pin.sprinting = on and true or false end })
+    s10:Button({ Name = "查看见过的状态属性名", Callback = function()
+        w(CX_STATE.Report())
     end })
 
     local s7 = tabSettings:Section("关于")
