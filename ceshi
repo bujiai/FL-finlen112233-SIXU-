@@ -321,7 +321,37 @@ function CX_CRACK.RunAll()
 	return n
 end
 
-function CX_CRACK.Status()
+-- ⭐⭐ 关键 hook：包住 KeypadScreen.StartKeypadSequence
+	--    保险箱/容器链路：玩家交互 → Interact() → KeypadScreen:StartKeypadSequence({
+	--        successFunc = 发 gizmoInteraction(objectId, "OpenSafe") })
+	--    ⇒ 包一层，**键盘一弹出就直接调 successFunc()** —— 跳过密码，且整条游戏流程照常跑。
+	function CX_CRACK.InstallKeypadHook()
+		local ok, Keypad = pcall(function()
+			return require(game:GetService("ReplicatedStorage").Devv).load("KeypadScreen")
+		end)
+		if not ok or type(Keypad) ~= "table" or type(Keypad.StartKeypadSequence) ~= "function" then
+			return false
+		end
+		if CX_CRACK._keypadHooked then return true end
+		local prev = Keypad.StartKeypadSequence
+		Keypad.StartKeypadSequence = function(self, opts)
+			local r = prev(self, opts)
+			if CX_CRACK.AutoKeypad and type(opts) == "table"
+				and type(opts.successFunc) == "function" then
+				task.delay(0.05, function()
+					pcall(opts.successFunc)
+					CX_CRACK.Done = CX_CRACK.Done + 1
+				end)
+			end
+			return r
+		end
+		CX_CRACK._keypadHooked = true
+		return true
+	end
+
+	pcall(CX_CRACK.InstallKeypadHook)
+
+	function CX_CRACK.Status()
 	return string.format("已破解 %d 个 / 失败 %d | 半径 %.0f | %s",
 		CX_CRACK.Done, CX_CRACK.Failed, CX_CRACK.Radius,
 		tostring(CX_CRACK.LastErr or "ok"))
@@ -1045,24 +1075,12 @@ do
 		local char, hum, _, torso = parts()
 		if not char or not hum then return false end
 		if CX_FLY.FreezeAnim then freezeAnim(char, true) end
-		setStates(hum, false)
-		pcall(function() hum:ChangeState(Enum.HumanoidStateType.Swimming) end)
-		pcall(function() hum.PlatformStand = true end)
-
-		local bg = Instance.new("BodyGyro")
-		bg.Name = "CXFlyGyro"
-		bg.P = 9e4
-		bg.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
-		bg.CFrame = torso.CFrame
-		bg.Parent = torso
-
-		local bv = Instance.new("BodyVelocity")
-		bv.Name = "CXFlyVel"
-		bv.Velocity = Vector3.zero
-		bv.MaxForce = Vector3.new(9e9, 9e9, 9e9)
-		bv.Parent = torso
-
-		CX_FLY._movers = { bg = bg, bv = bv, torso = torso }
+		-- 🔴 不再 PlatformStand / ChangeState（会复制给服务端 = 最明显的作弊特征）
+		-- 🔴 不再挂 BodyGyro / BodyVelocity（物理移动器 = 反作弊最爱扫的东西）
+		--    ⇒ 这两样是上一版被 ban 的直接原因，已彻底移除。
+		--    悬停改由"每帧写 CFrame 保持位置"实现（见 Step）。
+		pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false) end)
+		CX_FLY._movers = nil
 		return true
 	end
 
@@ -1079,23 +1097,17 @@ do
 			end
 		end
 
-		local m = CX_FLY._movers
 		local dir = moveDir(hum) * CX_FLY.Speed
 		local vy = vertical() * CX_FLY.VertSpeed
 		if vy ~= 0 then dir = dir + Vector3.new(0, vy, 0) end
 
-		-- ⭐ 悬停：没输入就把物理速度归零 —— 这是"不掉下去"的关键
-		if dir.Magnitude < 0.01 then
-			if m and m.bv then pcall(function() m.bv.Velocity = Vector3.zero end) end
-			CX_FLY._lastTarget = root.Position
-			return
+		-- ⭐ 没输入也要写 CFrame（保持原位）—— 这就是"悬停"，不需要任何 mover
+		local target = root.Position
+		if dir.Magnitude >= 0.01 then
+			target = target + dir * dt
+			CX_FLY.Steps = CX_FLY.Steps + 1
 		end
-
-		local target = root.Position + dir * dt
 		moveTo(char, root, target)
-		if m and m.bv then pcall(function() m.bv.Velocity = Vector3.zero end) end
-		if m and m.bg then pcall(function() m.bg.CFrame = CFrame.new(target) end) end
-		CX_FLY.Steps = CX_FLY.Steps + 1
 		CX_FLY._lastTarget = root.Position
 		CX_FLY.LastErr = nil
 	end
@@ -1106,19 +1118,11 @@ do
 			pcall(function() CX_FLY._conn:Disconnect() end)
 			CX_FLY._conn = nil
 		end
-		local m = CX_FLY._movers
-		if m then
-			pcall(function() if m.bg then m.bg:Destroy() end end)
-			pcall(function() if m.bv then m.bv:Destroy() end end)
-			CX_FLY._movers = nil
-		end
 		local char, hum = parts()
 		if char then
 			freezeAnim(char, false)
 			if hum then
-				setStates(hum, true)
-				pcall(function() hum:ChangeState(Enum.HumanoidStateType.RunningNoPhysics) end)
-				pcall(function() hum.PlatformStand = false end)
+				pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true) end)
 			end
 		end
 	end
@@ -1139,7 +1143,7 @@ do
 	end
 
 	function CX_FLY.Status()
-		return string.format("飞行=%s 跟视角=%s 冻结动画=%s 悬停=%s\\n位移=%d ★被拉回=%d | %s",
+		return string.format("飞行=%s 跟视角=%s 冻结动画=%s 无mover/无PlatformStand=是\\n位移=%d ★被拉回=%d | %s",
 			tostring(CX_FLY.Enabled), tostring(CX_FLY.CameraFly), tostring(CX_FLY.FreezeAnim),
 			tostring(CX_FLY.Hover), CX_FLY.Steps, CX_FLY.Pullbacks,
 			tostring(CX_FLY.LastErr or "ok"))
@@ -3168,7 +3172,7 @@ end
 
 
 -- ==================================================================
---  夜视（CX_NV）—— 绿色提亮 + ColorCorrection
+--  夜视（CX_NV）—— 变成"白天"：整体提亮，**不加绿色**
 -- ==================================================================
 do
 	CX_NV = CX_NV or {}
@@ -3183,16 +3187,19 @@ do
 				Brightness = L.Brightness, Ambient = L.Ambient,
 				OutdoorAmbient = L.OutdoorAmbient, ClockTime = L.ClockTime,
 				FogEnd = L.FogEnd, GlobalShadows = L.GlobalShadows,
+				ExposureCompensation = L.ExposureCompensation,
 			}
 		end
 		if on then
 			pcall(function()
+				L.ClockTime = 12
 				L.Brightness = 3
-				L.Ambient = Color3.fromRGB(90, 200, 90)
-				L.OutdoorAmbient = Color3.fromRGB(90, 200, 90)
-				L.ClockTime = 14
+				L.Ambient = Color3.fromRGB(178, 178, 178)
+				L.OutdoorAmbient = Color3.fromRGB(178, 178, 178)
 				L.FogEnd = 1000000
+				L.FogStart = 0
 				L.GlobalShadows = false
+				L.ExposureCompensation = 0.35
 			end)
 			local cc = L:FindFirstChild("CX_NightVision")
 			if not cc then
@@ -3201,9 +3208,10 @@ do
 				cc.Parent = L
 			end
 			pcall(function()
-				cc.TintColor = Color3.fromRGB(120, 255, 120)
-				cc.Brightness = 0.15
-				cc.Contrast = 0.15
+				cc.TintColor = Color3.fromRGB(255, 255, 255)
+				cc.Brightness = 0.12
+				cc.Contrast = 0.05
+				cc.Saturation = 0
 			end)
 		else
 			local o = CX_NV._orig
@@ -3214,6 +3222,7 @@ do
 				L.ClockTime = o.ClockTime
 				L.FogEnd = o.FogEnd
 				L.GlobalShadows = o.GlobalShadows
+				L.ExposureCompensation = o.ExposureCompensation
 			end)
 			local cc = L:FindFirstChild("CX_NightVision")
 			if cc then pcall(function() cc:Destroy() end) end
@@ -3221,7 +3230,7 @@ do
 	end
 
 	function CX_NV.Status()
-		return "夜视=" .. tostring(CX_NV.Enabled)
+		return "夜视（白天模式）=" .. tostring(CX_NV.Enabled)
 	end
 end
 
@@ -3668,6 +3677,11 @@ playWelcome(function()
     local s11 = Window:Tab({ Name = "保险箱破解" })
     s11:Slider({ Name = "破解扫描半径", Default = 60, Min = 10, Max = 1000,
         Callback = function(v) CX_CRACK.Radius = v end })
+    s11:Toggle({ Name = "免密码（键盘弹出即成功）", Default = true,
+        Callback = function(v) CX_CRACK.AutoKeypad = v end })
+    s11:Button({ Name = "安装键盘 hook", Callback = function()
+        w(CX_CRACK.InstallKeypadHook() and "键盘 hook 已安装" or "安装失败（找不到 KeypadScreen）")
+    end })
     s11:Button({ Name = "一键破解范围内所有容器", Callback = function()
         local n = CX_CRACK.RunAll()
         w(string.format("已对 %d 个容器发包", n))
