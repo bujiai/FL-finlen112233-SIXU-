@@ -96,7 +96,7 @@ function CX_META.Install()
 end
 pcall(CX_META.Install)
 CX_STATE = CX_STATE or {}
-CX_STATE.Enabled = false         
+CX_STATE.Enabled = true         
 CX_STATE.ForceSprint = true      
 CX_STATE.Log = {}                
 CX_STATE.Forged = 0
@@ -930,8 +930,8 @@ do
 	local LocalPlayer = Players.LocalPlayer
 
 	CX_FLY = CX_FLY or {}
-	CX_FLY.Enabled     = false
-	CX_FLY.Speed       = 40
+	CX_FLY.Enabled     = true
+	CX_FLY.Speed       = 95
 	CX_FLY.VertSpeed   = 30
 	CX_FLY.FreezeAnim  = true
 	CX_FLY.Pullbacks   = 0
@@ -2793,12 +2793,15 @@ if not WindUI then
 	error("[CX] WindUI 加载失败: " .. tostring(_wuErr))
 end
 local _WINDOW = WindUI:CreateWindow({
-	Title = "CX",
+	Title = "Tylox",
 	Author = "CX",
-	Folder = "CX",
+	Folder = "Tylox",
 	Size = UDim2.fromOffset(620, 480),
 	Background = (function()
 		local POOL = {
+			79035780602083, 115285451809270, 126071927593389, 105661627105291,
+			77508472999355, 107872248048503, 72869227895853, 126952765872927,
+			83853972032276,
 		}
 		if #POOL > 0 then
 			return "rbxassetid://" .. tostring(POOL[math.random(1, #POOL)])
@@ -2814,12 +2817,12 @@ local _WINDOW = WindUI:CreateWindow({
 	ToggleKey = Enum.KeyCode.RightShift,
 })
 pcall(function()
-	_WINDOW:Notify({ Title = "CX", Content = "v3 已加载（无动画 · 引擎前置）", Duration = 6 })
+	_WINDOW:Notify({ Title = "CX", Content = "Tylox 已加载", Duration = 6 })
 end)
 function CX_TOAST(msg)
 	local text = tostring(msg)
 	pcall(function()
-		_WINDOW:Notify({ Title = "CX", Content = text, Duration = 8 })
+		_WINDOW:Notify({ Title = "Tylox", Content = text, Duration = 8 })
 	end)
 end
 local EclipseUI = {}
@@ -3089,7 +3092,8 @@ playWelcome(function()
         Callback = function(v) CX_RAGE.Interval = math.max(0.03, v / 100) end })
     s1:Slider({ Name = "一轮最多打几个", Default = 8, Min = 1, Max = 20,
         Callback = function(v) CX_RAGE.MaxTargets = v end })
-    s1:Dropdown({ Name = "瞄准部位", Default = "Head", Values = { "Head", "HumanoidRootPart", "UpperTorso", "Torso" },
+    s1:Dropdown({ Name = "瞄准部位", Default = "Head",
+        Values = { "Head", "HumanoidRootPart", "UpperTorso", "Torso" },
         Callback = function(v) CX_RAGE.Part = v end })
     s1:Toggle({ Name = "不打同队", Default = false,
         Callback = function(v) CX_RAGE.TeamCheck = v end })
@@ -3097,9 +3101,10 @@ playWelcome(function()
         Callback = function(v) CX_RAGE.OnlyCombat = v end })
     s1:Toggle({ Name = "弹道绘制", Default = true,
         Callback = function(v) CX_RAGE.Tracer = v end })
-    s1:Button({ Name = "自检：RageBot 状态", Callback = function()
+    s1:Button({ Name = "自检", Callback = function()
         CX_TOAST(CX_RAGE.Status())
     end })
+
     local s3 = Window:Tab({ Name = "ESP" })
     s3:Toggle({ Name = "启用 ESP", Default = false,
         Callback = function(on) if ESP then ESP.Enabled = on end end })
@@ -3119,7 +3124,7 @@ playWelcome(function()
         Callback = function(on) if ESP then ESP.TeamCheck = on end end })
     s3:Slider({ Name = "ESP 最大距离", Default = 3000, Min = 100, Max = 99999,
         Callback = function(v) if ESP then ESP.SetFlags({ ["Esp Max Distance"] = { Value = v } }) end end })
-    s3:Button({ Name = "复位成原版外观（紫框+紫填充）", Callback = function()
+    s3:Button({ Name = "复位原版外观", Callback = function()
         if ESP then
             ESP.SetFlags({
                 ["Esp Box Style"]      = "Full",
@@ -3129,57 +3134,26 @@ playWelcome(function()
             CX_TOAST("ESP 外观已复位")
         end
     end })
+
     local s11 = Window:Tab({ Name = "保险箱破解" })
-    s11:Slider({ Name = "破解扫描半径", Default = 60, Min = 10, Max = 1000,
+    s11:Toggle({ Name = "开启破解", Default = false,
+        Callback = function(on)
+            if on then
+                CX_CRACK.InstallKeypadHook()
+                CX_CRACK.SetAuto(true)
+            else
+                CX_CRACK.SetAuto(false)
+            end
+        end })
+    s11:Slider({ Name = "扫描半径", Default = 60, Min = 10, Max = 1000,
         Callback = function(v) CX_CRACK.Radius = v end })
-    s11:Toggle({ Name = "自动循环破解（范围内一直扫）", Default = false,
-        Callback = function(v) CX_CRACK.SetAuto(v) end })
-    s11:Toggle({ Name = "免密码（键盘弹出即成功）", Default = true,
-        Callback = function(v) CX_CRACK.AutoKeypad = v end })
-    s11:Button({ Name = "安装键盘 hook", Callback = function()
-        CX_TOAST(CX_CRACK.InstallKeypadHook() and "键盘 hook 已安装" or "安装失败（找不到 KeypadScreen）")
-    end })
-    s11:Button({ Name = "一键破解范围内所有容器", Callback = function()
-        local n = CX_CRACK.RunAll()
-        w(string.format("已对 %d 个容器发包", n))
-    end })
-    s11:Button({ Name = "自检：破解状态", Callback = function()
-        CX_TOAST(CX_CRACK.Status())
-    end })
-    local s9 = Window:Tab({ Name = "飞行" })
-    s9:Toggle({ Name = "飞行", Default = false,
+
+    local s9 = Window:Tab({ Name = "修改移速" })
+    s9:Toggle({ Name = "修改移速", Default = true,
         Callback = function(on) CX_FLY.Set(on) end })
-    s9:Toggle({ Name = "走平台通道（服务端认可）", Default = true,
-        Callback = function(v) CX_FLY.UsePlatform = v end })
-    s9:Toggle({ Name = "上升（手机点这个）", Default = false,
-        Callback = function(v) CX_FLY.Up = v end })
-    s9:Toggle({ Name = "下降（手机点这个）", Default = false,
-        Callback = function(v) CX_FLY.Down = v end })
-    s9:Toggle({ Name = "定身（悬浮不落地）", Default = true,
-        Callback = function(v) CX_FLY.Anchor = v end })
-    s9:Toggle({ Name = "跟视角飞（W/S 沿相机朝向）", Default = true,
-        Callback = function(v) CX_FLY.CameraFly = v end })
-    s9:Toggle({ Name = "冻结动画（防一直奔跑）", Default = true,
-        Callback = function(v) CX_FLY.FreezeAnim = v end })
-    s9:Slider({ Name = "飞行速度", Default = 30, Min = 5, Max = 300,
+    s9:Slider({ Name = "速度", Default = 95, Min = 16, Max = 95,
         Callback = function(v) CX_FLY.Speed = v end })
-    s9:Slider({ Name = "飞行升降速度", Default = 22, Min = 5, Max = 200,
-        Callback = function(v) CX_FLY.VertSpeed = v end })
-    s9:Slider({ Name = "单帧位移上限", Default = 8, Min = 1, Max = 40,
-        Callback = function(v) CX_FLY.MaxStep = v end })
-    s9:Slider({ Name = "找平台范围", Default = 250, Min = 20, Max = 2000,
-        Callback = function(v) CX_FLY.PlatformRange = v end })
-    s9:Button({ Name = "★ 自检：飞行状态（看被拉回次数）", Callback = function()
-        CX_TOAST(CX_FLY.Status())
-    end })
-    local s10 = Window:Tab({ Name = "状态伪造" })
-    s10:Toggle({ Name = "伪造玩家状态（钉住最快档）", Default = false,
-        Callback = function(on) CX_STATE.Enabled = on end })
-    s10:Toggle({ Name = "永远上报「冲刺中」", Default = false,
-        Callback = function(on) CX_STATE.Pin.sprinting = on and true or false end })
-    s10:Button({ Name = "查看见过的状态属性名", Callback = function()
-        CX_TOAST(CX_STATE.Report())
-    end })
+
     local s12 = Window:Tab({ Name = "载具飞行" })
     s12:Toggle({ Name = "载具飞行（不限速）", Default = false,
         Callback = function(on) CX_VFLY.Set(on) end })
@@ -3195,33 +3169,32 @@ playWelcome(function()
         Callback = function(v) CX_VFLY.Thrust = v end })
     s12:Slider({ Name = "升力", Default = 250000, Min = 10000, Max = 3000000,
         Callback = function(v) CX_VFLY.Lift = v end })
-    s12:Button({ Name = "自检：载具飞行状态", Callback = function()
+    s12:Button({ Name = "自检", Callback = function()
         CX_TOAST(CX_VFLY.Status())
     end })
+
     local s13 = Window:Tab({ Name = "枪械" })
-    s13:Toggle({ Name = "无限子弹（本地补满 + 无限标记）", Default = false,
+    s13:Toggle({ Name = "无限子弹", Default = false,
         Callback = function(on) CX_WPN.Set(on) end })
     s13:Toggle({ Name = "秒换弹", Default = true,
         Callback = function(v) CX_WPN.InstantReload = v end })
     s13:Slider({ Name = "补弹间隔（×0.01 秒）", Default = 10, Min = 2, Max = 100,
         Callback = function(v) CX_WPN.TopUpRate = math.max(0.02, v / 100) end })
-    s13:Button({ Name = "立即补满当前武器", Callback = function()
+    s13:Button({ Name = "立即补满", Callback = function()
         local t = nil
         pcall(function()
-            local Devv = require(game:GetService("ReplicatedStorage").Devv)
-            t = Devv.load("ClientTools").GetLocalEquippedTool()
+            t = require(game:GetService("ReplicatedStorage").Devv).load("ClientTools").GetLocalEquippedTool()
         end)
         if t then CX_WPN.Fill(t) CX_TOAST("已补满") else CX_TOAST("手上没有武器") end
     end })
-    s13:Button({ Name = "自检：枪械状态", Callback = function()
+    s13:Button({ Name = "自检", Callback = function()
         CX_TOAST(CX_WPN.Status())
     end })
+
     local s14 = Window:Tab({ Name = "夜视" })
-    s14:Toggle({ Name = "夜视", Default = false,
+    s14:Toggle({ Name = "夜视（白天亮度）", Default = false,
         Callback = function(on) CX_NV.Set(on) end })
-    s14:Button({ Name = "自检：夜视状态", Callback = function()
-        CX_TOAST(CX_NV.Status())
-    end })
+
     local s15 = Window:Tab({ Name = "子弹追踪" })
     s15:Toggle({ Name = "启用强制命中", Default = false,
         Callback = function(on) CX_RAGE.Set(on) end })
@@ -3238,9 +3211,9 @@ playWelcome(function()
     s15:Dropdown({ Name = "命中部位", Default = "Head",
         Values = { "Head", "HumanoidRootPart", "UpperTorso", "Torso" },
         Callback = function(v) CX_RAGE.Part = v end })
-    s15:Toggle({ Name = "开火时画弹道", Default = true,
-        Callback = function(v) CX_RAGE.Tracer = v end })
-    s15:Button({ Name = "自检：追踪状态", Callback = function()
+    s15:Button({ Name = "自检", Callback = function()
         CX_TOAST(CX_RAGE.Status())
     end })
+
+
 end)
