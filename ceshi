@@ -922,25 +922,24 @@ do
 			CX_VFLY.Steps, tostring(CX_VFLY.LastErr or "ok"))
 	end
 end
+
 do
 	local Players = game:GetService("Players")
 	local RunService = game:GetService("RunService")
 	local UIS = game:GetService("UserInputService")
 	local LocalPlayer = Players.LocalPlayer
+
 	CX_FLY = CX_FLY or {}
 	CX_FLY.Enabled     = false
-	CX_FLY.Speed       = 50        
-	CX_FLY.VertSpeed   = 45
-	CX_FLY.Hover       = true      
-	CX_FLY.MarkDevv    = false      
+	CX_FLY.Speed       = 40
+	CX_FLY.VertSpeed   = 30
 	CX_FLY.FreezeAnim  = true
 	CX_FLY.Pullbacks   = 0
 	CX_FLY.Steps       = 0
 	CX_FLY.LastErr     = nil
 	CX_FLY._conn       = nil
-	CX_FLY._bv         = nil
-	CX_FLY._bg         = nil
 	CX_FLY._lastTarget = nil
+
 	local function parts()
 		local c = LocalPlayer.Character
 		if not (c and c.Parent) then return nil end
@@ -949,6 +948,7 @@ do
 		if not (hum and root) then return nil end
 		return c, hum, root
 	end
+
 	local function freezeAnim(char, frozen)
 		local anim = char:FindFirstChild("Animate")
 		if anim then pcall(function() anim.Disabled = frozen end) end
@@ -961,11 +961,13 @@ do
 			end
 		end)
 	end
+
 	local function moveDir(hum)
 		local md = hum.MoveDirection
 		if not md or md.Magnitude <= 0.01 then return Vector3.zero end
 		return md
 	end
+
 	local function vertical()
 		local v = 0
 		if CX_FLY.Up then v = v + 1 end
@@ -978,61 +980,48 @@ do
 		end)
 		return v
 	end
+
 	function CX_FLY.Start()
-		local char, hum, root = parts()
-		if not char or not hum or not root then return false end
+		local char, hum = parts()
+		if not char or not hum then return false end
 		if CX_FLY.FreezeAnim then freezeAnim(char, true) end
-		local bv = Instance.new("BodyVelocity")
-		bv.Name = "devvGlideVelocity"
-		if CX_FLY.MarkDevv then pcall(function() bv:SetAttribute("devvCheck", true) end) end
-		bv.MaxForce = Vector3.new(1000000, 1000000, 1000000)
-		bv.Velocity = Vector3.new(0, 0, 0)
-		bv.Parent = root
-		local bg = Instance.new("BodyGyro")
-		bg.Name = "devvGlideGyro"
-		if CX_FLY.MarkDevv then pcall(function() bg:SetAttribute("devvCheck", true) end) end
-		bg.P = 9e4
-		bg.MaxTorque = Vector3.new(1000000, 1000000, 1000000)
-		bg.CFrame = root.CFrame
-		bg.Parent = root
-		CX_FLY._bv, CX_FLY._bg = bv, bg
 		return true
 	end
+
 	function CX_FLY.Step(dt)
 		if not CX_FLY.Enabled then return end
 		local char, hum, root = parts()
 		if not char or not hum or not root then return end
+
 		if CX_FLY._lastTarget then
 			local drift = (root.Position - CX_FLY._lastTarget).Magnitude
-			if drift > math.max(8, CX_FLY.Speed * dt * 4) then
+			if drift > math.max(6, CX_FLY.Speed * dt * 4) then
 				CX_FLY.Pullbacks = CX_FLY.Pullbacks + 1
 			end
 		end
+
 		local dir = moveDir(hum) * CX_FLY.Speed
 		local vy = vertical() * CX_FLY.VertSpeed
-		if vy == 0 and CX_FLY.Hover then vy = 0 end          
-		local vel = dir + Vector3.new(0, vy, 0)
-		local bv = CX_FLY._bv
-		if bv and bv.Parent then
-			pcall(function() bv.Velocity = vel end)
+		if vy ~= 0 then dir = dir + Vector3.new(0, vy, 0) end
+
+		local target = root.Position
+		if dir.Magnitude >= 0.01 then
+			target = target + dir * dt
+			CX_FLY.Steps = CX_FLY.Steps + 1
 		end
-		local bg = CX_FLY._bg
-		if bg and bg.Parent then
-			local cam = workspace.CurrentCamera
-			if cam then pcall(function() bg.CFrame = cam.CFrame end) end
-		end
-		if vel.Magnitude > 0.01 then CX_FLY.Steps = CX_FLY.Steps + 1 end
+		local cf = CFrame.new(target, target + root.CFrame.LookVector)
+		pcall(function() root.CFrame = cf end)
+		pcall(function() char:PivotTo(cf) end)
 		CX_FLY._lastTarget = root.Position
 		CX_FLY.LastErr = nil
 	end
+
 	function CX_FLY.Stop()
 		CX_FLY.Enabled = false
 		if CX_FLY._conn then
 			pcall(function() CX_FLY._conn:Disconnect() end)
 			CX_FLY._conn = nil
 		end
-		if CX_FLY._bv then pcall(function() CX_FLY._bv:Destroy() end) CX_FLY._bv = nil end
-		if CX_FLY._bg then pcall(function() CX_FLY._bg:Destroy() end) CX_FLY._bg = nil end
 		local char, hum = parts()
 		if char then
 			freezeAnim(char, false)
@@ -1041,6 +1030,7 @@ do
 			end
 		end
 	end
+
 	function CX_FLY.Set(on)
 		if not on then CX_FLY.Stop() return true end
 		if CX_FLY.Enabled then return true end
@@ -1055,12 +1045,15 @@ do
 		end)
 		return true
 	end
+
 	function CX_FLY.Status()
-		return string.format("飞行=%s 白名单标记=%s 悬停=%s | 位移=%d 被拉回=%d | %s",
-			tostring(CX_FLY.Enabled), tostring(CX_FLY.MarkDevv), tostring(CX_FLY.Hover),
+		return string.format("飞行=%s 冻结动画=%s | 位移=%d 被拉回=%d | %s",
+			tostring(CX_FLY.Enabled), tostring(CX_FLY.FreezeAnim),
 			CX_FLY.Steps, CX_FLY.Pullbacks, tostring(CX_FLY.LastErr or "ok"))
 	end
 end
+
+
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -3164,8 +3157,6 @@ playWelcome(function()
         Callback = function(v) CX_FLY.Down = v end })
     s9:Toggle({ Name = "定身（悬浮不落地）", Default = true,
         Callback = function(v) CX_FLY.Anchor = v end })
-    s9:Toggle({ Name = "打 devvCheck 标记（⚠️实测会被 ban，建议关）", Default = true,
-        Callback = function(v) CX_FLY.MarkDevv = v end })
     s9:Toggle({ Name = "跟视角飞（W/S 沿相机朝向）", Default = true,
         Callback = function(v) CX_FLY.CameraFly = v end })
     s9:Toggle({ Name = "冻结动画（防一直奔跑）", Default = true,
