@@ -125,8 +125,7 @@ local function setupBypass()
     end)
 end
 
--- [改造] 参考脚本那套 setupBypass 换成新的元表 hook 绕过（见 CX_META）
-CX_META.Install()
+-- [改造] 参考脚本那套 setupBypass 已弃用；新的元表 hook 绕过见后面的 CX_META 引擎
 
 RunService:BindToRenderStep("BypassWS", Enum.RenderPriority.Last.Value, function()
     local char = LocalPlayer.Character
