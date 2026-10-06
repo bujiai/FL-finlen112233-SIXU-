@@ -930,9 +930,9 @@ do
 	CX_FLY = CX_FLY or {}
 	CX_FLY.Enabled     = false
 	CX_FLY.Speed       = 50        
-	CX_FLY.VertSpeed   = 35
+	CX_FLY.VertSpeed   = 45
 	CX_FLY.Hover       = true      
-	CX_FLY.MarkDevv    = true      
+	CX_FLY.MarkDevv    = false      
 	CX_FLY.FreezeAnim  = true
 	CX_FLY.Pullbacks   = 0
 	CX_FLY.Steps       = 0
@@ -964,13 +964,7 @@ do
 	local function moveDir(hum)
 		local md = hum.MoveDirection
 		if not md or md.Magnitude <= 0.01 then return Vector3.zero end
-		local cam = workspace.CurrentCamera
-		if not cam then return md end
-		local lv = Vector3.new(cam.CFrame.LookVector.X, 0, cam.CFrame.LookVector.Z)
-		local rv = Vector3.new(cam.CFrame.RightVector.X, 0, cam.CFrame.RightVector.Z)
-		if lv.Magnitude < 1e-4 then lv = Vector3.new(0, 0, -1) end
-		if rv.Magnitude < 1e-4 then rv = Vector3.new(1, 0, 0) end
-		return lv.Unit * -md.Z + rv.Unit * md.X
+		return md
 	end
 	local function vertical()
 		local v = 0
@@ -3170,7 +3164,7 @@ playWelcome(function()
         Callback = function(v) CX_FLY.Down = v end })
     s9:Toggle({ Name = "定身（悬浮不落地）", Default = true,
         Callback = function(v) CX_FLY.Anchor = v end })
-    s9:Toggle({ Name = "打 devvCheck 白名单标记（照游戏降落伞）", Default = true,
+    s9:Toggle({ Name = "打 devvCheck 标记（⚠️实测会被 ban，建议关）", Default = true,
         Callback = function(v) CX_FLY.MarkDevv = v end })
     s9:Toggle({ Name = "跟视角飞（W/S 沿相机朝向）", Default = true,
         Callback = function(v) CX_FLY.CameraFly = v end })
