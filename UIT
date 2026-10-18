@@ -34833,7 +34833,7 @@ BackgroundTransparency=1,
 },{
 af("UIListLayout",{
 FillDirection="Vertical",
-HorizontalAlignment=an.TextXAlignment,
+HorizontalAlignment="Center",
 VerticalAlignment="Center",
 Padding=UDim.new(0,4),
 }),
@@ -39919,24 +39919,24 @@ end
 
 
 --[[ ============================================================
-     äºŒæ”¹ï¼šç§»åŠ¨ç«¯ç¼©æ”¾èƒ¶å›Šï¼ˆScale Islandï¼‰
-     è§†è§‰ç§»æ¤è‡ª MoonLua UI v6.8.12 çš„ Window._island
+     二改：移动端缩放胶囊（Scale Island）
+     视觉移植自 MoonLua UI v6.8.12 的 Window._island
 
-     åŽŸç‰ˆï¼š200x38 åœ†è§’19 ç™½åº• + createButton æ¶‚çš„ç´«â†’ç´«çº¢æ¸å˜
-           å†…å±‚ 196x34 åœ†è§’17 é»‘åº• 0.8 é€æ˜Ž
-     çŽ°åœ¨ï¼šçº¯ç™½åº• + æ·¡ç´«æè¾¹ + èƒ¶å›Šä¸‹æ–¹ 3 é¢—ç´«è‰²æ˜Ÿæ˜Ÿ + ç¼©æ”¾ï¼ˆâˆ’ 100% +ï¼‰
+     原版：200x38 圆角19 白底 + createButton 涂的紫→紫红渐变
+           内层 196x34 圆角17 黑底 0.8 透明
+     现在：纯白底 + 淡紫描边 + 胶囊下方 3 颗紫色星星 + 缩放（− 100% +）
 
-     ç”µè„‘ç«¯ï¼š**å®Œå…¨ä¸åˆ›å»º**ï¼ˆå®˜æ–¹ UI ä¿æŒåŽŸæ ·ï¼ŒRightShift å¼€å…³çª—å£ï¼‰
-     ç§»åŠ¨ç«¯ï¼šè‡ªåŠ¨å‡ºçŽ°ï¼Œç‚¹æ ‡é¢˜æ”¶èµ·çª—å£ï¼Œç‚¹ Â± è°ƒçª—å£ç¼©æ”¾ï¼Œç‚¹ç™¾åˆ†æ¯”å›ž 100%
+     电脑端：**完全不创建**（官方 UI 保持原样，RightShift 开关窗口）
+     移动端：自动出现，点标题收起窗口，点 ± 调窗口缩放，点百分比回 100%
      ============================================================ ]]
 do
 	local CX = {
-		Enabled    = true,    -- å…¨å±€å…³æŽ‰ï¼šWindUI.CX_ISLAND.Enabled = false
-		MobileOnly = true,    -- true = åªåœ¨è§¦å±ç«¯å‡ºçŽ°ï¼ˆç”µè„‘ç«¯ä¸å˜ï¼‰
+		Enabled    = true,    -- 全局关掉：WindUI.CX_ISLAND.Enabled = false
+		MobileOnly = false,   -- false = 两端都显示（true 的话电脑端完全不创建）
 		MinScale   = 0.70,
 		MaxScale   = 1.40,
 		Step       = 0.05,
-		Manual     = false,   -- æ‰‹åŠ¨è°ƒè¿‡ç¼©æ”¾åŽç½® trueï¼ˆç»™å¤–éƒ¨è‡ªåŠ¨ç¼©æ”¾é€»è¾‘è®©ä½ï¼‰
+		Manual     = false,   -- 手动调过缩放后置 true（给外部自动缩放逻辑让位）
 		GuiName    = "WindUIScaleIsland",
 		Instances  = {},
 	}
@@ -39986,7 +39986,7 @@ do
 		local parentGui = cxParent()
 		if not parentGui then return nil end
 
-		-- åŽ»é‡ï¼šå¤–éƒ¨è„šæœ¬å¯èƒ½å·²ç»æŒ‚è¿‡åŒæ¬¾èƒ¶å›Šï¼ˆæ—§åä¹Ÿè®¤ï¼‰
+		-- 去重：外部脚本可能已经挂过同款胶囊（旧名也认）
 		local existing = nil
 		pcall(function() existing = parentGui:FindFirstChild(CX.GuiName) end)
 		if not existing then
@@ -39995,7 +39995,7 @@ do
 		if existing then return nil end
 
 		cfg = cfg or {}
-		local STAR = Color3.fromRGB(191, 90, 242)   -- Moon çš„ Accent ç´«
+		local STAR = Color3.fromRGB(191, 90, 242)   -- Moon 的 Accent 紫
 		local WHITE = Color3.fromRGB(255, 255, 255)
 		local NEAR_WHITE = Color3.fromRGB(252, 250, 255)
 		local INK = Color3.fromRGB(38, 34, 48)
@@ -40012,7 +40012,7 @@ do
 			DisplayOrder = 2147483000,
 		}, parentGui)
 
-		-- å¤–æ¡†ï¼šçº¯ç™½èƒ¶å›Šï¼ˆåŽ»æŽ‰ Moon çš„ç´«â†’ç´«çº¢æ¸å˜ï¼‰
+		-- 外框：纯白胶囊（去掉 Moon 的紫→紫红渐变）
 		local outer = ni("Frame", {
 			Name = "Island",
 			AnchorPoint = Vector2.new(0.5, 0),
@@ -40026,7 +40026,7 @@ do
 		cxCorner(outer, math.floor(H / 2))
 		cxStroke(outer, STAR, 1, 0.55)
 
-		-- æžæ·¡æŠ•å½±
+		-- 极淡投影
 		ni("ImageLabel", {
 			Name = "Shadow",
 			AnchorPoint = Vector2.new(0.5, 0),
@@ -40041,7 +40041,7 @@ do
 			ZIndex = 4,
 		}, gui)
 
-		-- å†…å±‚ï¼šè¿‘ç™½ï¼ˆMoon åŽŸç‰ˆæ˜¯é»‘åº• 0.8ï¼‰
+		-- 内层：近白（Moon 原版是黑底 0.8）
 		local inner = ni("Frame", {
 			Name = "Inner",
 			Position = UDim2.new(0, 4, 0, 4),
@@ -40058,7 +40058,7 @@ do
 			Position = UDim2.new(0, 10, 0, 0),
 			Size = UDim2.new(0, 18, 1, 0),
 			BackgroundTransparency = 1,
-			Text = "âœ¦",
+			Text = "✦",
 			TextColor3 = STAR,
 			TextSize = 16,
 			Font = Enum.Font.GothamBold,
@@ -40089,7 +40089,7 @@ do
 			BackgroundColor3 = STAR,
 			BackgroundTransparency = 0.88,
 			BorderSizePixel = 0,
-			Text = "âˆ’",
+			Text = "−",
 			TextColor3 = STAR,
 			TextSize = 16,
 			Font = Enum.Font.GothamBold,
@@ -40129,7 +40129,7 @@ do
 		}, inner)
 		cxCorner(btnPlus, 12)
 
-		-- èƒ¶å›Šä¸‹æ–¹ä¸€æŽ’ç´«è‰²æ˜Ÿæ˜Ÿ
+		-- 胶囊下方一排紫色星星
 		local holder = ni("Frame", {
 			Name = "Stars",
 			AnchorPoint = Vector2.new(0.5, 0),
@@ -40148,7 +40148,7 @@ do
 				Position = UDim2.new(0.5, c[1], 0, math.floor(STAR_H / 2)),
 				Size = UDim2.fromOffset(c[2] * 2, STAR_H),
 				BackgroundTransparency = 1,
-				Text = "âœ¦",
+				Text = "✦",
 				TextColor3 = STAR,
 				TextTransparency = c[3],
 				TextSize = c[2],
@@ -40232,8 +40232,8 @@ do
 	aa.CreateWindow = function(self, config)
 		local w = cxOrigCreateWindow(self, config)
 
-		-- å»¶è¿Ÿä¸€å¸§å†æŒ‚ï¼šç»™å¤–éƒ¨è„šæœ¬ï¼ˆæ¯”å¦‚å®ƒè‡ªå·±å·²ç»å†™äº†åŒæ¬¾èƒ¶å›Šï¼‰å…ˆå»ºçš„æœºä¼šï¼Œ
-		-- CX.Attach é‡Œä¼šæŒ‰ ScreenGui åå­—åŽ»é‡ï¼Œé¡ºåºåäº†å°±ä¼šå‡ºä¸¤ä¸ªã€‚
+		-- 延迟一帧再挂：给外部脚本（比如它自己已经写了同款胶囊）先建的机会，
+		-- CX.Attach 里会按 ScreenGui 名字去重，顺序反了就会出两个。
 		local function cxSpawn()
 			local inst = CX.Attach(w, config)
 			if inst then
@@ -40253,25 +40253,25 @@ end
 
 
 --[[ ============================================================
-     äºŒæ”¹ï¼šæ ‡é¢˜ / ä½œè€… ç‚«å½©ï¼ˆè‰²æ¿å–è‡ªåœ£å¥¥é‡Œï¼ŒæŸ”åŒ–å¤„ç†ï¼‰
+     二改：标题 / 作者 炫彩（色板取自圣奥里，柔化处理）
 
-     å’Œåœ£å¥¥é‡ŒåŽŸç‰ˆçš„åŒºåˆ«ï¼š
-       è‰²æ¿   6 æ®µé«˜é¥±å’Œ â†’ 8 æ®µæŸ”åŒ–ï¼ˆäº®åº¦å…¨ >=128ï¼Œé¦–å°¾åŒè‰²ï¼‰
-       é€Ÿåº¦   0.35ï¼ˆ2.9s ä¸€è½®ï¼‰â†’ 0.16ï¼ˆ6.25s ä¸€è½®ï¼‰
-       ç›¸ä½   ç»å¯¹æ—¶é—´ â†’ ç´¯ç§¯ dtï¼ˆæŽ‰å¸§ä¸è·³ï¼‰
-       åˆ·æ–°   æ¯å¸§ â†’ 30Hz èŠ‚æµ
-       å®ˆæŠ¤   0.5s ç¡¬åˆ· â†’ 4Hz ä¸”åªåœ¨é¢œè‰²è¢«æ”¹æ—¶å†™
-     æŽ¥å£ï¼šWindUI.CX_RAINBOW.Enabled / Speed / Hz / Sequence
+     和圣奥里原版的区别：
+       色板   6 段高饱和 → 8 段柔化（亮度全 >=128，首尾同色）
+       速度   0.35（2.9s 一轮）→ 0.16（6.25s 一轮）
+       相位   绝对时间 → 累积 dt（掉帧不跳）
+       刷新   每帧 → 30Hz 节流
+       守护   0.5s 硬刷 → 4Hz 且只在颜色被改时写
+     接口：WindUI.CX_RAINBOW.Enabled / Speed / Hz / Sequence
      ============================================================ ]]
 do
 	local RB = {
 		Enabled  = true,
-		Speed    = 0.16,   -- æ¯ç§’æŽ¨è¿›çš„ç›¸ä½æ¯”ä¾‹ï¼ˆè¶Šå°è¶Šæ…¢ï¼‰
-		Hz       = 30,     -- åˆ·æ–°é¢‘çŽ‡
-		GuardHz  = 4,      -- å®ˆæŠ¤é¢‘çŽ‡ï¼ˆæŠŠè¢«ä¸»é¢˜æ”¹æŽ‰çš„ç™½è‰²åˆ·å›žæ¥ï¼‰
+		Speed    = 0.16,   -- 每秒推进的相位比例（越小越慢）
+		Hz       = 30,     -- 刷新频率
+		GuardHz  = 4,      -- 守护频率（把被主题改掉的白色刷回来）
 		AuthorTransparency = 0.10,
 
-		-- æ·±è‰²ä¸»é¢˜ç”¨ï¼šäº®åº¦é«˜ã€é¥±å’Œä¸­ç­‰ï¼Œé¦–å°¾ä¸¥æ ¼åŒè‰² â‡’ Offset å¾ªçŽ¯æ— ç¼
+		-- 深色主题用：亮度高、饱和中等，首尾严格同色 ⇒ Offset 循环无缝
 		Sequence = ColorSequence.new({
 			ColorSequenceKeypoint.new(0.00, Color3.fromRGB(255, 128, 138)),
 			ColorSequenceKeypoint.new(0.14, Color3.fromRGB(255, 178, 126)),
@@ -40283,7 +40283,7 @@ do
 			ColorSequenceKeypoint.new(1.00, Color3.fromRGB(255, 128, 138)),
 		}),
 
-		-- æµ…è‰²ä¸»é¢˜ç”¨ï¼šåŒæ ·çš„è‰²ç›¸é¡ºåºï¼Œä½†åŽ‹æš—ï¼Œç™½åº•ä¸Šæ‰çœ‹å¾—æ¸…
+		-- 浅色主题用：同样的色相顺序，但压暗，白底上才看得清
 		SequenceLight = ColorSequence.new({
 			ColorSequenceKeypoint.new(0.00, Color3.fromRGB(196, 38, 62)),
 			ColorSequenceKeypoint.new(0.14, Color3.fromRGB(196, 96, 26)),
@@ -40296,7 +40296,7 @@ do
 		}),
 	}
 
-	-- æŒ‰çª—å£ä¸»é¢˜èƒŒæ™¯äº®åº¦é€‰è‰²æ¿ï¼šæ·±è‰²åº•ç”¨äº®æ¿ï¼Œæµ…è‰²åº•ç”¨æš—æ¿
+	-- 按窗口主题背景亮度选色板：深色底用亮板，浅色底用暗板
 	local lastTheme = nil
 	local function pickSeq()
 		local th = aa.Theme
@@ -40314,7 +40314,7 @@ do
 	local accT = 0
 	local guardT = 0
 
-	-- æ ‡é¢˜å’Œä½œè€…éƒ½åœ¨ Topbar.Left.Title è¿™ä¸ªå®¹å™¨é‡Œï¼ˆsrc é‡Œå°±æ˜¯è¿™ä¹ˆå»ºçš„ï¼‰
+	-- 标题和作者都在 Topbar.Left.Title 这个容器里（src 里就是这么建的）
 	local function holderOf(win)
 		local m = win and win.UIElements and win.UIElements.Main
 		m = m and m.Main
@@ -40324,7 +40324,7 @@ do
 
 	local function attachOne(lb, isAuthor)
 		if not lb then return end
-		-- å·²ç»å¤„ç†è¿‡å°±åˆ«é‡å¤æŒ‚
+		-- 已经处理过就别重复挂
 		if lb:FindFirstChild("CX_Rainbow") then return end
 
 		local g = Instance.new("UIGradient")
@@ -40332,7 +40332,7 @@ do
 		g.Color = pickSeq()
 		g.Parent = lb
 
-		-- æ¸å˜ä½œç”¨åœ¨ TextColor3 ä¸Šï¼›ä¸»é¢˜ä¼šæŠŠé¢œè‰²æ”¹æŽ‰ï¼Œæ‰€ä»¥å…ˆåˆ·ç™½å†é æ¸å˜ä¸Šè‰²
+		-- 渐变作用在 TextColor3 上；主题会把颜色改掉，所以先刷白再靠渐变上色
 		lb.TextColor3 = WHITE
 
 		if isAuthor and lb.TextTransparency > RB.AuthorTransparency then
@@ -40368,7 +40368,7 @@ do
 	rs.RenderStepped:Connect(function(dt)
 		if not RB.Enabled then return end
 
-		-- æ²¡æœ‰ç›®æ ‡æ—¶å¶å°”é‡è¯•ï¼ˆçª—å£å¯èƒ½é‡å»ºè¿‡ï¼‰
+		-- 没有目标时偶尔重试（窗口可能重建过）
 		if #items == 0 then
 			guardT = guardT + (tonumber(dt) or 0)
 			if guardT >= 1 then
@@ -40383,7 +40383,7 @@ do
 		accT = accT + (tonumber(dt) or 0)
 		if accT < 1 / RB.Hz then return end
 
-		-- ç›¸ä½æŒ‰çœŸå®žæ—¶é—´æŽ¨è¿›ï¼šæŽ‰å¸§ä¹Ÿä¸ä¼šè·³
+		-- 相位按真实时间推进：掉帧也不会跳
 		phase = (phase + accT * RB.Speed) % 1
 		accT = 0
 
@@ -40399,12 +40399,12 @@ do
 			end
 		end
 
-		-- å®ˆæŠ¤ï¼šä¸»é¢˜åˆ‡æ¢ä¼šé‡è®¾ TextColor3ï¼Œåªåœ¨çœŸçš„è¢«æ”¹æ—¶æ‰å†™
+		-- 守护：主题切换会重设 TextColor3，只在真的被改时才写
 		guardT = guardT + dt
 		if guardT >= 1 / RB.GuardHz then
 			guardT = 0
 
-			-- ä¸»é¢˜æ¢äº† â‡’ æ¢è‰²æ¿ï¼ˆDark ç”¨äº®æ¿ï¼ŒLight ç”¨æš—æ¿ï¼‰
+			-- 主题换了 ⇒ 换色板（Dark 用亮板，Light 用暗板）
 			local tname = aa.Theme and aa.Theme.Name
 			if tname ~= lastTheme then
 				lastTheme = tname
@@ -40431,25 +40431,25 @@ end
 
 
 --[[ ============================================================
-     äºŒæ”¹ â‘¢ï¼šçª—å£ç«‹ç»˜ï¼ˆäººç‰©è¶´åœ¨ UI ä¸Šæ–¹ï¼‰
+     二改 ③：窗口立绘（人物趴在 UI 上方）
 
-     å›¾ç‰‡ï¼šhttps://tylox.gf.b0a.cn/img/rael-cut.png
-           ï¼ˆå·²æŠ å›¾ã€é€æ˜Žåº•ã€1024Ã—444ï¼Œæ‰‹è‡‚è£æŽ‰ï¼‰
+     图片：https://tylox.gf.b0a.cn/img/rael-cut.png
+           （已抠图、透明底、1024×444，手臂裁掉）
 
-     é»˜è®¤ï¼šå»ºçª—åŽè‡ªåŠ¨æŒ‚ï¼Œåº•è¾¹è´´çª—å£é¡¶è¾¹ã€‚
-           ZIndex = 50 â€”â€” èƒŒæ™¯(3) ä¹‹ä¸Šã€æŽ§ä»¶å®¹å™¨(97) ä¹‹ä¸‹ï¼ˆSibling æ¨¡å¼ï¼‰
-           â‡’ æ•´å¼ å›¾åœ¨çª—å£å¤–é¢ï¼Œä¸æŒ¡ä»»ä½•æŽ§ä»¶ã€‚
+     默认：建窗后自动挂，底边贴窗口顶边。
+           ZIndex = 50 —— 背景(3) 之上、控件容器(97) 之下（Sibling 模式）
+           ⇒ 整张图在窗口外面，不挡任何控件。
 
-     å…³æŽ‰ï¼šWindUI.CX_HERO.Enabled = false
-     æ¢å›¾ï¼šWindUI.CX_HERO.Source = "https://..." / "æœ¬åœ°æ–‡ä»¶å" / "rbxassetid://..."
+     关掉：WindUI.CX_HERO.Enabled = false
+     换图：WindUI.CX_HERO.Source = "https://..." / "local file" / "rbxassetid://..."
      ============================================================ ]]
 do
 	local H = {
 		Enabled   = true,
 		Source    = "https://tylox.gf.b0a.cn/img/rael-cut.png",
 		Height    = 210,
-		OffsetX   = 0,
-		OffsetY   = 0,        -- 0 = åº•è¾¹è´´çª—å£é¡¶è¾¹
+		OffsetX   = 60,       -- 往右偏一点（0 = 居中）
+		OffsetY   = 0,        -- 0 = 底边贴窗口顶边
 		Right     = false,
 		ZIndex    = 50,
 		FadeIn    = true,
@@ -40459,17 +40459,17 @@ do
 		Instances = {},
 	}
 
-	-- ä¸‹è½½ä»»æ„äºŒè¿›åˆ¶ï¼ˆå›¾ç‰‡ï¼‰ï¼Œä¸‰ç§ http å–æ³•å…œåº•
+	-- 下载任意二进制（图片），三种 http 取法兜底
 	local function dl(url)
 		local fns = {
 			function() return game:HttpGet(url) end,
 			function() return game:HttpGetAsync(url) end,
 			function()
 				local req = (syn and syn.request) or (http and http.request) or http_request or request
-				if not req then error("æ²¡æœ‰å¯ç”¨çš„ http æ–¹æ³•") end
+				if not req then error("no http method available") end
 				local ok, res = pcall(req, { Url = url, Method = "GET" })
 				if ok and type(res) == "table" then return res.Body end
-				error("request å¤±è´¥")
+				error("request failed")
 			end,
 		}
 		for _, f in ipairs(fns) do
@@ -40481,10 +40481,10 @@ do
 		return nil
 	end
 
-	-- æ¥æºç»Ÿä¸€æˆ ImageLabel.Image èƒ½ç”¨çš„å­—ç¬¦ä¸²
+	-- 来源统一成 ImageLabel.Image 能用的字符串
 	function H.Resolve(source, force)
 		if type(source) ~= "string" or source == "" then
-			return nil, "æ²¡æœ‰ç»™å›¾ç‰‡æ¥æº"
+			return nil, "no image source"
 		end
 
 		if source:match("^rbxassetid://") or source:match("^rbxasset://") or source:match("^rbxthumb://") then
@@ -40492,12 +40492,12 @@ do
 		end
 
 		if not getcustomasset then
-			return nil, "è¿™ä¸ªæ‰§è¡Œå™¨æ²¡æœ‰ getcustomassetï¼Œç”¨ä¸äº†æœ¬åœ°å›¾ç‰‡"
+			return nil, "this executor has no getcustomasset"
 		end
 
 		if source:match("^https?://") then
 			if not writefile then
-				return nil, "è¿™ä¸ªæ‰§è¡Œå™¨æ²¡æœ‰ writefileï¼Œæ— æ³•ç¼“å­˜å›¾ç‰‡"
+				return nil, "this executor has no writefile"
 			end
 
 			local name = source:match("([^/]+)$") or "hero.png"
@@ -40525,16 +40525,16 @@ do
 			if not cached or force then
 				local body = dl(source)
 				if not body then
-					return nil, "ä¸‹è½½å¤±è´¥ï¼š" .. source
+					return nil, "download failed: " .. source
 				end
 				local isPng = body:sub(1, 8) == "\137PNG\r\n\26\n"
 				local isJpg = body:sub(1, 2) == "\255\216"
 				if not (isPng or isJpg) then
-					return nil, "ä¸‹è½½åˆ°çš„ä¸æ˜¯å›¾ç‰‡ï¼ˆå¼€å¤´ä¸æ˜¯ PNG/JPEGï¼‰"
+					return nil, "not an image (no PNG/JPEG magic)"
 				end
 				local ok, err = pcall(writefile, path, body)
 				if not ok then
-					return nil, "å†™æ–‡ä»¶å¤±è´¥ï¼š" .. tostring(err)
+					return nil, "writefile failed: " .. tostring(err)
 				end
 				didDownload = true
 			end
@@ -40543,14 +40543,14 @@ do
 			if ok and type(res) == "string" and res ~= "" then
 				return res, didDownload and "download" or "cache"
 			end
-			return nil, "getcustomasset å¤±è´¥ï¼š" .. tostring(res)
+			return nil, "getcustomasset failed: " .. tostring(res)
 		end
 
 		local ok, res = pcall(getcustomasset, source)
 		if ok and type(res) == "string" and res ~= "" then
 			return res, "local"
 		end
-		return nil, "getcustomasset å¤±è´¥ï¼ˆ" .. tostring(res) .. "ï¼‰"
+		return nil, "getcustomasset failed (" .. tostring(res) .. "）"
 	end
 
 	function H.Attach(win, opts)
@@ -40564,7 +40564,7 @@ do
 		local asset, err = H.Resolve(H.Source, opts.ForceDownload == true or H.ForceDownload)
 		if not asset then
 			pcall(function()
-				aa:Notify({ Title = "ç«‹ç»˜æ²¡åŠ è½½ä¸Š", Content = tostring(err), Duration = 6 })
+				aa:Notify({ Title = "Hero failed to load", Content = tostring(err), Duration = 6 })
 			end)
 			return nil
 		end
@@ -40577,7 +40577,7 @@ do
 		end
 
 		local h = opts.Height or H.Height
-		local aspect = opts.Aspect or 2.3        -- å…ˆç”¨ä¼°ç®—å€¼ï¼ŒåŠ è½½åŽæŒ‰ ImageRectSize ä¿®æ­£
+		local aspect = opts.Aspect or 2.3        -- 先用估算值，加载后按 ImageRectSize 修正
 		local w = math.floor(h * aspect)
 
 		local offsetX = opts.OffsetX or H.OffsetX
@@ -40600,7 +40600,7 @@ do
 		img.ZIndex = opts.ZIndex or H.ZIndex
 		img.Parent = parent
 
-		-- å›¾ç‰‡çœŸæ­£åŠ è½½åŽæŒ‰çœŸå®žå®½é«˜æ¯”ä¿®æ­£ï¼ˆæ¢ rael-full è¿™ç§æ¯”ä¾‹ä¸åŒçš„å›¾ä¹Ÿä¸ä¼šå˜å½¢ï¼‰
+		-- 图片真正加载后按真实宽高比修正（换 rael-full 这种比例不同的图也不会变形）
 		local function fixAspect()
 			pcall(function()
 				local sz = img.ImageRectSize
@@ -40646,6 +40646,25 @@ do
 				end
 			end)
 		end
+
+		-- 🔴 跟随窗口开关：
+		--   Window:Close() 是「内层 Main.Main 立即 Visible=false + 外层 Main 高度缓动到 0
+		--   + 0.4 秒后才把外层 Visible=false」。
+		--   立绘挂在外层，不跟内层走 ⇒ 关闭后还会残留 0.4 秒。
+		--   监听内层 Visible 同步，就能做到「点关闭立刻消失」。
+		pcall(function()
+			local inner = win.UIElements and win.UIElements.Main and win.UIElements.Main.Main
+			if inner and inner.GetPropertyChangedSignal then
+				inner:GetPropertyChangedSignal("Visible"):Connect(function()
+					pcall(function()
+						if img and img.Parent then
+							img.Visible = inner.Visible
+						end
+					end)
+				end)
+				img.Visible = inner.Visible
+			end
+		end)
 
 		pcall(function()
 			if type(win.OnDestroy) == "function" then
@@ -40705,29 +40724,29 @@ end
 
 
 --[[ ============================================================
-     äºŒæ”¹ â‘£ï¼šå†™æ­»çš„ã€Œè®¾ç½®ã€åˆ†åŒº
+     二改 ④：写死的「设置」分区
 
-     æ¯ä¸ªçª—å£å»ºå¥½åŽè‡ªåŠ¨åœ¨ä¾§è¾¹æ **æœ€åº•éƒ¨**åŠ ä¸€ä¸ªã€Œè®¾ç½®ã€åˆ†åŒºï¼š
-       Â· çŽ©å®¶ä¿¡æ¯ï¼šå¤´åƒ / æ˜¾ç¤ºå / ç”¨æˆ·å / UserId / æ³¨å…¥å™¨ / JobId / PlaceId
-       Â· å¤–è§‚ï¼šé®ç½©ç¨‹åº¦ï¼ˆçª—å£èƒŒæ™¯é€æ˜Žåº¦ï¼‰
-       Â· é…ç½®ï¼šä¿å­˜ / è¯»å–
-       Â· å±é™©ï¼šç§»é™¤è„šæœ¬ï¼ˆé”€æ¯çª—å£ + æ¸…æŽ‰æ‰€æœ‰äºŒæ”¹ GUIï¼‰
+     每个窗口建好后自动在侧边栏**最底部**加一个「设置」分区：
+       · 玩家信息：头像 / 显示名 / 用户名 / UserId / 注入器 / JobId / PlaceId
+       · 外观：遮罩程度（窗口背景透明度）
+       · 配置：保存 / 读取
+       · 危险：移除脚本（销毁窗口 + 清掉所有二改 GUI）
 
-     å…³æŽ‰ï¼šWindUI.CX_SETTINGS.Enabled = false
-     æ”¹åï¼šWindUI.CX_SETTINGS.SectionTitle = "è®¾ç½®"
+     关掉：WindUI.CX_SETTINGS.Enabled = false
+     改名：WindUI.CX_SETTINGS.SectionTitle = "Settings"
      ============================================================ ]]
 do
 	local S = {
 		Enabled      = true,
-		SectionTitle = "è®¾ç½®",
+		SectionTitle = "Settings",
 		Icon         = "settings",
 		ConfigName   = "default",
-		Mask         = 0.15,      -- é»˜è®¤èƒŒæ™¯é€æ˜Žåº¦ï¼ˆ0 = ä¸é€æ˜Žï¼‰
+		Mask         = 0.15,      -- 默认背景透明度（0 = 不透明）
 	}
 
-	-- æ³¨å…¥å™¨è¯†åˆ«ï¼šidentifyexecutor ä¼˜å…ˆï¼Œå…¶æ¬¡ç‰¹å¾æ£€æµ‹
+	-- 注入器识别：identifyexecutor 优先，其次特征检测
 	local function executorName()
-		local name = "æœªçŸ¥"
+		local name = "Unknown"
 
 		pcall(function()
 			if type(identifyexecutor) == "function" then
@@ -40748,19 +40767,19 @@ do
 			end
 		end)
 
-		if name ~= "æœªçŸ¥" then return name end
+		if name ~= "Unknown" then return name end
 
-		-- ç‰¹å¾æ£€æµ‹ï¼ˆè¯†åˆ«ä¸å‡ºæ¥æ—¶è‡³å°‘ç»™ä¸ªæ–¹å‘ï¼‰
+		-- 特征检测（识别不出来时至少给个方向）
 		local flags = {}
 		if type(KRNL_LOADED) ~= "nil" then table.insert(flags, "Krnl") end
 		if type(is_sirhurt_closure) == "function" then table.insert(flags, "SirHurt") end
 		if type(secure_load) == "function" then table.insert(flags, "Sentinel") end
-		if type(getscriptbytecode) == "function" then table.insert(flags, "æœ‰ getscriptbytecode") end
-		if type(getcustomasset) == "function" then table.insert(flags, "æœ‰ getcustomasset") end
+		if type(getscriptbytecode) == "function" then table.insert(flags, "getscriptbytecode") end
+		if type(getcustomasset) == "function" then table.insert(flags, "getcustomasset") end
 		if #flags > 0 then
-			return "æœªçŸ¥ï¼ˆ" .. table.concat(flags, " / ") .. "ï¼‰"
+			return "Unknown (" .. table.concat(flags, " / ") .. "）"
 		end
-		return "æœªçŸ¥"
+		return "Unknown"
 	end
 
 	local function collectInfo()
@@ -40795,12 +40814,14 @@ do
 
 		local info = collectInfo()
 
-		-- ä¾§è¾¹æ æœ€åº•éƒ¨ï¼šSection æ˜¯åŽåˆ›å»ºçš„ï¼Œè‡ªç„¶æŽ’åœ¨æœ€åŽ
-		local sec = win:Section({ Title = S.SectionTitle, Icon = S.Icon, Opened = true })
-		local tab = sec:Tab({ Title = S.SectionTitle, Icon = S.Icon })
+		-- 直接建页签，**不用 Section**：
+		--   Section 一旦调用 :Tab() 就会把 Expandable 设成 true 并显示折叠箭头，
+		--   这里要的是「固定在侧边栏最底部、不可折叠」的入口。
+		--   排序靠 defer：调用方的页签都建完了，这个自然排最后。
+		local tab = win:Tab({ Title = S.SectionTitle, Icon = S.Icon })
 
-		-- ---------- çŽ©å®¶ä¿¡æ¯ ----------
-		local who = tab:Section({ Title = "çŽ©å®¶ä¿¡æ¯", TextXAlignment = Enum.TextXAlignment.Left })
+		-- ---------- 玩家信息 ----------
+		local who = tab:Section({ Title = "Player", TextXAlignment = Enum.TextXAlignment.Left })
 
 		if info.avatar then
 			pcall(function()
@@ -40814,25 +40835,25 @@ do
 		})
 
 		who:Paragraph({
-			Title = "æ³¨å…¥å™¨",
+			Title = "Executor",
 			Desc = info.executor,
 		})
 
 		who:Paragraph({
-			Title = "æœåŠ¡å™¨",
-			Desc = "JobId: " .. (info.jobId ~= "" and info.jobId or "ï¼ˆå•æœº / Studioï¼‰")
-				.. "  Â·  PlaceId: " .. tostring(info.placeId),
+			Title = "Server",
+			Desc = "JobId: " .. (info.jobId ~= "" and info.jobId or "(solo / Studio)")
+				.. "  ·  PlaceId: " .. tostring(info.placeId),
 		})
 
 		who:Button({
-			Title = "å¤åˆ¶ä¿¡æ¯åˆ°å‰ªè´´æ¿",
+			Title = "Copy info",
 			Callback = function()
 				local text = table.concat({
-					"æ˜¾ç¤ºå: " .. info.display,
-					"ç”¨æˆ·å: " .. info.name,
+					"Display: " .. info.display,
+					"User: " .. info.name,
 					"UserId: " .. tostring(info.uid),
-					"æ³¨å…¥å™¨: " .. info.executor,
-					"JobId: " .. (info.jobId ~= "" and info.jobId or "ï¼ˆå•æœºï¼‰"),
+					"Executor: " .. info.executor,
+					"JobId: " .. (info.jobId ~= "" and info.jobId or "(solo)"),
 					"PlaceId: " .. tostring(info.placeId),
 				}, "\n")
 
@@ -40842,20 +40863,20 @@ do
 				end)
 				pcall(function()
 					aa:Notify({
-						Title = ok and "å·²å¤åˆ¶" or "å¤åˆ¶å¤±è´¥",
-						Content = ok and "çŽ©å®¶ä¿¡æ¯å·²å¤åˆ¶" or "è¿™ä¸ªæ‰§è¡Œå™¨æ²¡æœ‰ setclipboard",
+						Title = ok and "Copied" or "Copy failed",
+						Content = ok and "player info copied" or "this executor has no setclipboard",
 						Duration = 3,
 					})
 				end)
 			end,
 		})
 
-		-- ---------- å¤–è§‚ ----------
-		local look = tab:Section({ Title = "å¤–è§‚", TextXAlignment = Enum.TextXAlignment.Left })
+		-- ---------- 外观 ----------
+		local look = tab:Section({ Title = "Appearance", TextXAlignment = Enum.TextXAlignment.Left })
 
 		look:Slider({
-			Title = "é®ç½©ç¨‹åº¦ï¼ˆèƒŒæ™¯é€æ˜Žåº¦ %ï¼‰",
-			Desc = "0 = ä¸é€æ˜Žï¼›è¶Šé«˜è¶Šèƒ½çœ‹è§åŽé¢çš„æ¸¸æˆç”»é¢",
+			Title = "Mask (bg transparency %)",
+			Desc = "0 = opaque; higher = see-through",
 			Default = math.floor(S.Mask * 100 + 0.5),
 			Min = 0,
 			Max = 90,
@@ -40866,12 +40887,12 @@ do
 			end,
 		})
 
-		-- ---------- é…ç½® ----------
-		local cfgSec = tab:Section({ Title = "é…ç½®", TextXAlignment = Enum.TextXAlignment.Left })
+		-- ---------- 配置 ----------
+		local cfgSec = tab:Section({ Title = "Config", TextXAlignment = Enum.TextXAlignment.Left })
 		local cfgName = S.ConfigName
 
 		cfgSec:Input({
-			Title = "é…ç½®å",
+			Title = "Config name",
 			Default = cfgName,
 			Placeholder = "default",
 			Callback = function(t)
@@ -40880,7 +40901,7 @@ do
 		})
 
 		cfgSec:Button({
-			Title = "ä¿å­˜é…ç½®",
+			Title = "Save config",
 			Callback = function()
 				local ok, err = pcall(function()
 					local cfg = win.ConfigManager:Config(cfgName)
@@ -40888,8 +40909,8 @@ do
 				end)
 				pcall(function()
 					aa:Notify({
-						Title = ok and "å·²ä¿å­˜" or "ä¿å­˜å¤±è´¥",
-						Content = ok and ("é…ç½®ï¼š" .. cfgName) or tostring(err),
+						Title = ok and "Saved" or "Save failed",
+						Content = ok and ("Config: " .. cfgName) or tostring(err),
 						Duration = 3,
 					})
 				end)
@@ -40897,7 +40918,7 @@ do
 		})
 
 		cfgSec:Button({
-			Title = "è¯»å–é…ç½®",
+			Title = "Load config",
 			Callback = function()
 				local ok, err = pcall(function()
 					local cfg = win.ConfigManager:GetConfig(cfgName)
@@ -40906,22 +40927,22 @@ do
 				end)
 				pcall(function()
 					aa:Notify({
-						Title = ok and "å·²è¯»å–" or "è¯»å–å¤±è´¥",
-						Content = ok and ("é…ç½®ï¼š" .. cfgName) or tostring(err),
+						Title = ok and "Loaded" or "Load failed",
+						Content = ok and ("Config: " .. cfgName) or tostring(err),
 						Duration = 3,
 					})
 				end)
 			end,
 		})
 
-		-- ---------- å±é™© ----------
-		local danger = tab:Section({ Title = "å±é™©æ“ä½œ", TextXAlignment = Enum.TextXAlignment.Left })
+		-- ---------- 危险 ----------
+		local danger = tab:Section({ Title = "Danger", TextXAlignment = Enum.TextXAlignment.Left })
 
 		danger:Button({
-			Title = "ç§»é™¤è„šæœ¬",
-			Desc = "é”€æ¯ç•Œé¢ï¼Œå¹¶æ¸…æŽ‰ç¼©æ”¾èƒ¶å›Š / ç«‹ç»˜",
+			Title = "Remove script",
+			Desc = "destroy UI and cleanup",
 			Callback = function()
-				-- å…ˆæ¸…ç†äºŒæ”¹ GUIï¼Œæœ€åŽé”€æ¯çª—å£ï¼ˆé”€æ¯åŽ win ä¸èƒ½å†ç”¨ï¼‰
+				-- 先清理二改 GUI，最后销毁窗口（销毁后 win 不能再用）
 				pcall(function()
 					if aa.CX_ISLAND and aa.CX_ISLAND.Instances then
 						for _, inst in ipairs(aa.CX_ISLAND.Instances) do
@@ -40955,7 +40976,7 @@ do
 			local function spawn()
 				pcall(function() S.Build(w) end)
 			end
-			-- å»¶è¿Ÿä¸€å¸§ï¼šè®©è°ƒç”¨æ–¹æŠŠè‡ªå·±çš„é¡µç­¾éƒ½å»ºå®Œï¼Œè®¾ç½®åˆ†åŒºæ‰èƒ½æŽ’åœ¨æœ€ä¸‹é¢
+			-- 延迟一帧：让调用方把自己的页签都建完，设置分区才能排在最下面
 			if task and type(task.defer) == "function" then
 				task.defer(spawn)
 			else
@@ -40965,6 +40986,125 @@ do
 
 		return w
 	end
+end
+
+
+--[[ ============================================================
+     二改 ⑤：屏幕自适配（CX_AUTOSCALE）
+
+     按视口高度算窗口缩放，再用视口宽度兜底：
+         s = clamp(视口高 / 720, 0.72, 1.15)
+         若「未缩放窗口宽 × s」> 视口宽 × 92% ⇒ 再压 s
+
+     · 值没变就不调（SetUIScale 内部带 0.2s 缓动，反复调会一直播动画）
+     · 胶囊手动调过缩放（CX_ISLAND.Manual）⇒ 让位，不覆盖用户的选择
+     · 监听 ViewportSize，转屏 / 改分辨率自动重算
+
+     关掉：WindUI.CX_AUTOSCALE.Enabled = false
+     ============================================================ ]]
+do
+	local A = {
+		Enabled       = true,
+		BaseHeight    = 720,    -- 设计基准高度（这个高度下缩放 = 1.0）
+		Min           = 0.72,
+		Max           = 1.15,
+		MaxWidthRatio = 0.92,   -- 窗口最多占屏幕宽度的 92%
+		Instances     = {},
+	}
+
+	local cam = workspace.CurrentCamera
+
+	local function apply(win)
+		if not A.Enabled or not win then return end
+		if win.Destroyed then return end
+
+		-- 胶囊手动调过缩放 ⇒ 让位
+		if aa.CX_ISLAND and aa.CX_ISLAND.Manual then return end
+
+		local vp = cam and cam.ViewportSize
+		if not vp or vp.Y <= 0 or vp.X <= 0 then return end
+
+		local s = math.clamp(vp.Y / A.BaseHeight, A.Min, A.Max)
+
+		-- 当前缩放
+		local cur = 1
+		pcall(function()
+			local v = win:GetUIScale()
+			if type(v) == "number" and v > 0 then cur = v end
+		end)
+
+		-- 宽度兜底：先把当前 AbsoluteSize 还原成「未缩放宽度」
+		local absW = 0
+		pcall(function()
+			local m = win.UIElements and win.UIElements.Main
+			if m then absW = m.AbsoluteSize.X end
+		end)
+
+		if absW > 0 then
+			local baseW = absW / (cur > 0 and cur or 1)
+			local maxW = vp.X * A.MaxWidthRatio
+			if baseW > 0 and baseW * s > maxW then
+				s = maxW / baseW
+			end
+		end
+
+		s = math.clamp(s, 0.5, A.Max)
+		s = math.floor(s * 100 + 0.5) / 100
+
+		-- 值没变就别调
+		if math.abs(s - cur) < 0.01 then return end
+
+		pcall(function() win:SetUIScale(s) end)
+	end
+
+	function A.Apply(win)
+		if win then
+			apply(win)
+		else
+			for _, w in ipairs(A.Instances) do
+				pcall(function() apply(w) end)
+			end
+		end
+	end
+
+	aa.CX_AUTOSCALE = A
+
+	local autoOrigCreateWindow = aa.CreateWindow
+	aa.CreateWindow = function(self, config)
+		local w = autoOrigCreateWindow(self, config)
+
+		table.insert(A.Instances, w)
+
+		pcall(function()
+			local function go()
+				pcall(function() apply(w) end)
+			end
+			-- 等一帧让布局完成（AbsoluteSize 这时才有值），再补一次防异步布局
+			if task and type(task.defer) == "function" then
+				task.defer(function()
+					go()
+					if task.delay then
+						task.delay(0.2, go)
+					end
+				end)
+			else
+				go()
+			end
+		end)
+
+		return w
+	end
+
+	-- 视口变化：转屏 / 改分辨率
+	pcall(function()
+		if cam then
+			cam:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+				for _, w in ipairs(A.Instances) do
+					pcall(function() apply(w) end)
+				end
+			end)
+		end
+	end)
 end
 
 return aa
